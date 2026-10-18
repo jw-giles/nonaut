@@ -6,14 +6,12 @@
   A security-first agent harness powered by <a href="https://github.com/nolabs-ai/nono">nono</a>.
 </p>
 
-> Other harnesses ask the agent to respect a boundary. Nonaut lets it try—and makes the boundary technically unavoidable.
-
-Nonaut is a minimal terminal agent for Codex / ChatGPT. The provider control
-plane handles authentication and inference; every model-requested tool runs in
-a fresh kernel-enforced sandbox.
-
-> [!NOTE]
-> Codex / ChatGPT is currently the only provider. Sessions are ephemeral.
+> **Other harnesses ask the agent to respect a boundary. Nonaut lets it try.
+> The boundary remains technically unavoidable.**
+>
+> A minimal terminal agent where authentication and inference stay in the
+> control plane, while every model-requested tool runs in a fresh,
+> kernel-enforced sandbox.
 
 ## Preview
 
@@ -63,6 +61,11 @@ make check
 
 `make fmt`, `make lint`, `make test`, `make build`, `make smoke`, and `make run`
 are also available.
+
+## Limitations
+
+- Codex / ChatGPT is currently the only provider.
+- Sessions are ephemeral.
 
 ## Releases
 

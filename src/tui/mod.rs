@@ -355,7 +355,7 @@ impl App {
             Paragraph::new(Line::from(vec![
                 Span::styled(format!("  {BRAND_MARK}  "), Style::new().fg(ACCENT).bold()),
                 Span::styled("nonaut", Style::new().fg(FOREGROUND).bold()),
-                Span::styled(" — security-first agent harness", Style::new().fg(MUTED)),
+                Span::styled(" · security-first agent harness", Style::new().fg(MUTED)),
             ]))
             .style(Style::new().bg(BACKGROUND)),
             brand,
