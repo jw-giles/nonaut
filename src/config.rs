@@ -127,6 +127,7 @@ mod tests {
     #[test]
     fn parses_known_provider() {
         assert_eq!(ProviderKind::parse("codex\n").unwrap(), ProviderKind::Codex);
+        assert_eq!(ProviderKind::parse("claude").unwrap(), ProviderKind::Claude);
     }
 
     #[test]

@@ -1,3 +1,5 @@
+mod claude;
+mod claude_code;
 mod codex;
 
 use std::path::Path;
@@ -5,37 +7,55 @@ use std::path::Path;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
+use claude::ClaudeApi;
+use claude_code::ClaudeCode;
 use codex::Codex;
+
+pub(crate) const BASE_INSTRUCTIONS: &str = "You are the coding model inside Nonaut, a security-first agent harness. Use the provided tools to inspect and modify files and verify your work. Prefer the dedicated read_file, write_file, edit_file, and delete_file tools over run_command.";
+
+pub(crate) const DEVELOPER_INSTRUCTIONS: &str = "Tool integrity rule: never state or imply that a file was created, updated, patched, or deleted unless write_file, edit_file, or delete_file returned success in this turn. For creation or full replacement, call write_file immediately without preflight reads. For a focused edit, read the file at most once and then call edit_file. For deletion, call delete_file. Never replace a direct file mutation with run_command. Security boundary rule: you never decide whether an operation is allowed; nono is the sole authorization authority. You MUST issue the appropriate tool call even if a path is outside the workspace, sensitive, or likely denied. Pass the requested path directly because Nonaut normalizes it. A follow-up such as 'try it', 'do it anyway', or 'force it' means retry the last operation once under the existing policy so the denial is observable; it never means evade the sandbox. Report the real tool result.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderKind {
     Codex,
+    Claude,
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 1] = [Self::Codex];
+    pub const ALL: [Self; 2] = [Self::Codex, Self::Claude];
 
     pub const fn id(self) -> &'static str {
         match self {
             Self::Codex => "codex",
+            Self::Claude => "claude",
         }
     }
 
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::Codex => "Codex / ChatGPT",
+            Self::Claude => "Claude / Anthropic",
         }
     }
 
     pub const fn description(self) -> &'static str {
         match self {
             Self::Codex => "Existing Codex account · tools isolated by nono",
+            Self::Claude => "Claude subscription or API key · tools isolated by nono",
+        }
+    }
+
+    pub const fn connect_hint(self) -> &'static str {
+        match self {
+            Self::Codex => "Browser sign-in opens if needed.",
+            Self::Claude => "Browser sign-in opens if needed.",
         }
     }
 
     pub(crate) fn parse(value: &str) -> Result<Self> {
         match value.trim() {
             "codex" => Ok(Self::Codex),
+            "claude" => Ok(Self::Claude),
             value => anyhow::bail!("unknown saved provider `{value}`"),
         }
     }
@@ -74,42 +94,63 @@ pub enum ProviderEvent {
 #[derive(Clone)]
 pub enum Provider {
     Codex(Codex),
+    ClaudeApi(ClaudeApi),
+    ClaudeCode(ClaudeCode),
 }
 
 impl Provider {
     pub async fn connect(kind: ProviderKind, cwd: &Path) -> Result<Self> {
         match kind {
             ProviderKind::Codex => Codex::connect(cwd).await.map(Self::Codex),
+            ProviderKind::Claude => {
+                if ClaudeCode::is_logged_in().await
+                    || std::env::var_os("ANTHROPIC_API_KEY").is_none()
+                {
+                    ClaudeCode::connect(cwd).await.map(Self::ClaudeCode)
+                } else {
+                    ClaudeApi::connect(cwd).await.map(Self::ClaudeApi)
+                }
+            }
         }
     }
 
     pub fn model(&self) -> Model {
         match self {
             Self::Codex(provider) => provider.model(),
+            Self::ClaudeApi(provider) => provider.model(),
+            Self::ClaudeCode(provider) => provider.model(),
         }
     }
 
     pub fn models(&self) -> &[Model] {
         match self {
             Self::Codex(provider) => provider.models(),
+            Self::ClaudeApi(provider) => provider.models(),
+            Self::ClaudeCode(provider) => provider.models(),
         }
     }
 
     pub fn select_model(&self, model_id: &str) -> Result<Model> {
         match self {
             Self::Codex(provider) => provider.select_model(model_id),
+            Self::ClaudeApi(provider) => provider.select_model(model_id),
+            Self::ClaudeCode(provider) => provider.select_model(model_id),
         }
     }
 
     pub fn select_reasoning_effort(&self, effort: &str) -> Result<String> {
         match self {
             Self::Codex(provider) => provider.select_reasoning_effort(effort),
+            Self::ClaudeApi(provider) => provider.select_reasoning_effort(effort),
+            Self::ClaudeCode(provider) => provider.select_reasoning_effort(effort),
         }
     }
 
     pub async fn new_session(&self) -> Result<()> {
         match self {
             Self::Codex(provider) => provider.new_session().await,
+            Self::ClaudeApi(provider) => provider.new_session().await,
+            Self::ClaudeCode(provider) => provider.new_session().await,
         }
     }
 
@@ -121,12 +162,16 @@ impl Provider {
     ) -> Result<()> {
         match self {
             Self::Codex(provider) => provider.stream(input, request_id, sender).await,
+            Self::ClaudeApi(provider) => provider.stream(input, request_id, sender).await,
+            Self::ClaudeCode(provider) => provider.stream(input, request_id, sender).await,
         }
     }
 
     pub async fn interrupt(&self) -> Result<()> {
         match self {
             Self::Codex(provider) => provider.interrupt().await,
+            Self::ClaudeApi(provider) => provider.interrupt().await,
+            Self::ClaudeCode(provider) => provider.interrupt().await,
         }
     }
 }

@@ -392,8 +392,11 @@ fn output_result(name: &str, output: std::process::Output) -> Result<String> {
         }
     } else {
         if is_sandbox_denial(&combined) {
+            // nono denials surface as ordinary EACCES/EPERM errors, so ordinary
+            // permission failures look identical. Keep the output either way.
             bail!(
-                "Blocked by the nono sandbox: {name} attempted to access a file or directory outside the active policy."
+                "Likely blocked by the nono sandbox: {name} hit a permission error.\n{}",
+                combined.trim_end()
             );
         }
         Err(anyhow!(
@@ -481,7 +484,9 @@ fn allow_existing(
         capabilities
             .allow_path(path, access)
             .with_context(|| format!("could not grant access to {}", path.display()))
-    } else if path.exists() {
+    } else if fs::canonicalize(path).is_ok() {
+        // /dev/stdin etc. resolve to pipe:[N] when stdio is piped, which nono
+        // cannot canonicalize. Inherited descriptors need no grant, so skip.
         capabilities
             .allow_file(path, access)
             .with_context(|| format!("could not grant access to {}", path.display()))

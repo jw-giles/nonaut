@@ -29,17 +29,25 @@
 The TUI and provider connection run normally. Only model-requested execution
 crosses the nono boundary.
 
+## Providers
+
+Nonaut currently supports two providers:
+
+- Codex / ChatGPT through the `codex` app-server and your existing login.
+- Claude through the official `claude` CLI and subscription login, with
+  `ANTHROPIC_API_KEY` available as a fallback.
+
 ## Run
 
-Requires a compatible `codex` CLI with app-server support and Rust 1.99.1.
-Nono 0.80 is embedded directly; no separate `nono` installation is needed.
+Requires Rust 1.99.1. Nono 0.80 is embedded directly, so no separate `nono`
+installation is needed.
 
 ```sh
 make run
 ```
 
-Nonaut reuses your existing Codex login and remembers the selected provider,
-model, and reasoning effort.
+Nonaut reuses your existing Codex or Claude login and remembers the selected
+provider, model, and reasoning effort.
 
 | Command | Action |
 | --- | --- |
@@ -64,8 +72,9 @@ are also available.
 
 ## Limitations
 
-- Codex / ChatGPT is currently the only provider.
-- Sessions are ephemeral.
+- Claude subscription access requires the official Claude Code CLI.
+- Nonaut does not restore conversations after restart. Provider CLIs may retain
+  their own local session data.
 
 ## Releases
 
