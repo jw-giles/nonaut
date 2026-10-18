@@ -95,6 +95,7 @@ else
     install_dir="$HOME/.local/bin"
 fi
 destination="$install_dir/nonaut"
+metadata="$install_dir/.nonaut-install"
 
 temporary=''
 staged=''
@@ -120,6 +121,26 @@ install_binary() {
     staged=''
 }
 
+record_install() {
+    channel=$1
+    installed=$2
+    staged="$install_dir/.nonaut-metadata-$$"
+    printf 'channel=%s\nversion=%s\n' "$channel" "$installed" >"$staged" \
+        || fatal "Could not write installation metadata to $install_dir."
+    mv -f "$staged" "$metadata" \
+        || fatal "Could not replace installation metadata in $install_dir."
+    staged=''
+}
+
+installed_channel=''
+installed_version=''
+if [ -x "$destination" ]; then
+    installed_version=$($destination --version 2>/dev/null | awk '{print $2}' || true)
+fi
+if [ -f "$metadata" ]; then
+    installed_channel=$(sed -n 's/^channel=//p' "$metadata" | head -n 1)
+fi
+
 show_path_hint() {
     case ":${PATH:-}:" in
         *:"$install_dir":*) ;;
@@ -132,6 +153,11 @@ show_path_hint() {
 if [ "$INSTALL_MODE" = "main" ]; then
     command -v cargo >/dev/null 2>&1 \
         || fatal "Cargo is required to build Nonaut from main."
+    if [ -x "$destination" ]; then
+        notice "Replacing the installed Nonaut binary with the latest main build..."
+    else
+        notice "Installing the latest Nonaut main build..."
+    fi
     notice "Downloading the latest Nonaut source from main..."
     temporary=$(mktemp -d "${TMPDIR:-/tmp}/nonaut.XXXXXX") \
         || fatal "Could not create a temporary directory."
@@ -151,6 +177,7 @@ if [ "$INSTALL_MODE" = "main" ]; then
     [ -x "$binary" ] || fatal "The source build did not produce a Nonaut binary."
     version=$($binary --version 2>/dev/null | awk '{print $2}')
     install_binary "$binary"
+    record_install "main" "${version:-unknown}"
     success "Installed Nonaut ${version:-from main} to $destination"
     show_path_hint
     exit 0
@@ -175,12 +202,15 @@ printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'
 version=${tag#v}
 
 if [ -x "$destination" ]; then
-    installed_version=$($destination --version 2>/dev/null | awk '{print $2}' || true)
-    if [ "$installed_version" = "$version" ]; then
+    if [ "$installed_channel" = "release" ] && [ "$installed_version" = "$version" ]; then
         success "Nonaut $version is already installed."
         exit 0
     fi
-    notice "Updating Nonaut ${installed_version:-unknown} to $version..."
+    if [ "$installed_channel" = "main" ]; then
+        notice "Replacing the main build with Nonaut release $version..."
+    else
+        notice "Updating Nonaut ${installed_version:-unknown} to $version..."
+    fi
 else
     notice "Installing Nonaut $version for $target..."
 fi
@@ -215,6 +245,7 @@ tar -xzf "$temporary/$archive" -C "$temporary"
     || fatal "The downloaded Nonaut binary could not run on this system."
 
 install_binary "$temporary/nonaut"
+record_install "release" "$version"
 
 success "Installed Nonaut $version to $destination"
 show_path_hint

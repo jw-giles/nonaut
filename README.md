@@ -151,6 +151,8 @@ curl -fsSL https://raw.githubusercontent.com/nolabs-ai/nonaut/main/install.sh | 
 ```
 
 Running the command again downloads and rebuilds the latest source.
+Switching between the regular installer and `--from-main` replaces the existing
+binary with the selected release or development channel.
 
 ## Limitations
 
