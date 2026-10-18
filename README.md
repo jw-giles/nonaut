@@ -13,6 +13,18 @@
 > control plane, while every model-requested tool runs in a fresh,
 > kernel-enforced sandbox.
 
+## Features
+
+- Kernel-enforced isolation for every model-requested tool execution.
+- Read/write access to the active workspace, with access outside it denied.
+- Network blocking and environment scrubbing inside tool sandboxes.
+- Codex / ChatGPT and Claude provider support.
+- Streaming terminal UI with model and reasoning selection.
+- Interruptible responses and commands.
+- Concise file diffs, tool summaries, and sandbox denial messages.
+- Explicitly persistent sessions with detach, attach, list, and kill commands.
+- Provider-free `exec` mode for direct sandbox use and policy testing.
+
 ## Preview
 
 <p align="center">
@@ -37,13 +49,14 @@ Nonaut currently supports two providers:
 - Claude through the official `claude` CLI and subscription login, with
   `ANTHROPIC_API_KEY` available as a fallback.
 
-## Run
+## Usage
 
-Requires Rust 1.99.1. Nono 0.80 is embedded directly, so no separate `nono`
-installation is needed.
+Nono 0.80 is embedded directly, so no separate `nono` installation is needed.
+Prebuilt binaries are published on the
+[GitHub Releases](https://github.com/SequeI/nonaut/releases) page.
 
 ```sh
-make run
+nonaut
 ```
 
 Nonaut reuses your existing Codex or Claude login and remembers the selected
@@ -99,14 +112,37 @@ session metadata.
 
 ## Development
 
+Building from source requires Rust 1.99.1.
+
+```sh
+git clone git@github.com:SequeI/nonaut.git
+cd nonaut
+make run
+```
+
+Development commands:
+
+| Command | Action |
+| --- | --- |
+| `make run` | Build an optimized binary and launch Nonaut |
+| `make build` | Build the optimized binary |
+| `make check` | Check formatting, run Clippy, and run unit tests |
+| `make integration` | Run provider-free tests against the real sandbox and TUI |
+| `make smoke` | Smoke-test the release binary through `nonaut exec` |
+| `make fmt` | Format the Rust workspace |
+| `make lint` | Run Clippy with warnings denied |
+| `make test` | Run the Rust test suite |
+| `make clean` | Remove Cargo build artifacts |
+
+Before opening a pull request, run:
+
 ```sh
 make check
 make integration
+make smoke
 ```
 
-`make integration` runs provider-free black-box tests against the real nono
-sandbox and terminal interface. `make fmt`, `make lint`, `make test`,
-`make build`, `make smoke`, and `make run` are also available.
+The integration suite does not connect to a provider or consume model tokens.
 
 ## Limitations
 
