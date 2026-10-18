@@ -1,3 +1,4 @@
+mod cli;
 mod config;
 mod mcp;
 mod providers;
@@ -26,6 +27,22 @@ pub async fn run_mcp(workspace: std::path::PathBuf) -> Result<()> {
 
 pub async fn run(args: Vec<String>) -> Result<()> {
     sessions::run_cli(args).await
+}
+
+pub fn print_help() {
+    cli::print_help();
+}
+
+pub fn print_version() {
+    cli::print_version();
+}
+
+pub fn print_command_help(command: &str, usage: &str, description: &str) {
+    cli::print_command_help(command, usage, description);
+}
+
+pub fn print_error(error: &anyhow::Error) {
+    cli::print_error(error);
 }
 
 pub async fn run_exec(command: String) -> Result<String> {

@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::{IsTerminal, Read, Write},
+    io::{Read, Write},
     os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -13,7 +13,6 @@ use crossterm::{
     cursor::Show,
     event::{DisableMouseCapture, PopKeyboardEnhancementFlags},
     execute,
-    style::{Color, Stylize},
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -25,24 +24,10 @@ use tokio::{
     time::{MissedTickBehavior, interval, sleep},
 };
 
+use crate::cli::{self, ACCENT, MUTED, SUCCESS, styled};
+
 const DETACHED_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-const ACCENT: Color = Color::Rgb {
-    r: 232,
-    g: 115,
-    b: 74,
-};
-const SUCCESS: Color = Color::Rgb {
-    r: 126,
-    g: 198,
-    b: 153,
-};
-const MUTED: Color = Color::Rgb {
-    r: 136,
-    g: 136,
-    b: 136,
-};
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 enum Control {
@@ -101,12 +86,34 @@ pub(crate) async fn run_cli(args: Vec<String>) -> Result<()> {
     match args.as_slice() {
         [] => start().await,
         [command] if command == "ps" => list().await,
+        [command, flag] if command == "ps" && matches!(flag.as_str(), "--help" | "-h") => {
+            cli::print_command_help("ps", "nonaut ps", "List sessions kept alive with /detach.");
+            Ok(())
+        }
+        [command, flag] if command == "attach" && matches!(flag.as_str(), "--help" | "-h") => {
+            cli::print_command_help(
+                "attach",
+                "nonaut attach <session>",
+                "Attach to a persistent Nonaut session.",
+            );
+            Ok(())
+        }
         [command, id] if command == "attach" => attach_existing(id).await,
+        [command, flag] if command == "kill" && matches!(flag.as_str(), "--help" | "-h") => {
+            cli::print_command_help(
+                "kill",
+                "nonaut kill <session> | --all | -a",
+                "Stop one or all persistent Nonaut sessions.",
+            );
+            Ok(())
+        }
         [command, flag] if command == "kill" && matches!(flag.as_str(), "--all" | "-a") => {
             kill_all().await
         }
         [command, id] if command == "kill" => kill_one(id).await,
-        _ => bail!("usage: nonaut [ps | attach <session> | kill <session> | kill --all | kill -a]"),
+        [command, ..] => {
+            bail!("unknown command or arguments `{command}`\n\nRun `nonaut help` for usage.")
+        }
     }
 }
 
@@ -148,7 +155,7 @@ async fn attach_existing(id: &str) -> Result<()> {
 async fn list() -> Result<()> {
     let paths = Paths::discover()?;
     let sessions = live_sessions(&paths).await?;
-    let color = std::io::stdout().is_terminal();
+    let color = cli::color_enabled();
     let width = crossterm::terminal::size()
         .map(|(columns, _)| usize::from(columns))
         .unwrap_or(120);
@@ -239,17 +246,6 @@ fn render_session_list(sessions: &[Metadata], color: bool, terminal_width: usize
     output
 }
 
-fn styled(value: &str, color_value: Color, bold: bool, enabled: bool) -> String {
-    if !enabled {
-        return value.to_owned();
-    }
-    if bold {
-        format!("{}", value.with(color_value).bold())
-    } else {
-        format!("{}", value.with(color_value))
-    }
-}
-
 fn pad(value: &str, width: usize) -> String {
     let padding = width.saturating_sub(value.chars().count());
     format!("{value}{}", " ".repeat(padding))
@@ -286,7 +282,7 @@ async fn kill_one(id: &str) -> Result<()> {
     }
     let _ = send_control(&paths.socket(id), &Control::Kill).await;
     cleanup(&paths, id);
-    println!("Killed session {id}.");
+    cli::success(&format!("Killed session {id}."));
     Ok(())
 }
 
@@ -297,11 +293,15 @@ async fn kill_all() -> Result<()> {
         let _ = send_control(&paths.socket(&metadata.id), &Control::Kill).await;
         cleanup(&paths, &metadata.id);
     }
-    println!(
-        "Killed {} persistent session{}.",
-        sessions.len(),
-        if sessions.len() == 1 { "" } else { "s" }
-    );
+    if sessions.is_empty() {
+        cli::notice("No persistent sessions to kill.", None);
+    } else {
+        cli::success(&format!(
+            "Killed {} persistent session{}.",
+            sessions.len(),
+            if sessions.len() == 1 { "" } else { "s" }
+        ));
+    }
     Ok(())
 }
 
@@ -513,7 +513,10 @@ async fn proxy(id: &str, socket: &Path) -> Result<()> {
 
     let paths = Paths::discover()?;
     if paths.metadata(id).exists() {
-        println!("Detached session {id}. Reattach with `nonaut attach {id}`.");
+        cli::notice(
+            &format!("Session {id} detached."),
+            Some(&format!("Reattach with: nonaut attach {id}")),
+        );
     }
     result
 }

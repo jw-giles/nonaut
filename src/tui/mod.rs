@@ -1111,12 +1111,13 @@ impl App {
     }
 
     fn command_help() -> String {
-        SLASH_COMMANDS
+        let commands = SLASH_COMMANDS
             .iter()
             .filter(|command| command.visible)
             .map(|command| format!("{:<12} {}", command.name, command.description))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        format!("## Commands\n\n{commands}")
     }
 
     fn interrupt_active(&self) {
