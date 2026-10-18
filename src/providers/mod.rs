@@ -107,12 +107,6 @@ impl Provider {
         }
     }
 
-    pub fn account(&self) -> Option<&str> {
-        match self {
-            Self::Codex(provider) => provider.account(),
-        }
-    }
-
     pub async fn new_session(&self) -> Result<()> {
         match self {
             Self::Codex(provider) => provider.new_session().await,

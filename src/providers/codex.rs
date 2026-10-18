@@ -37,7 +37,6 @@ pub(crate) struct Codex {
     models: Vec<Model>,
     selected_model: Arc<StdRwLock<Model>>,
     selected_reasoning_effort: Arc<StdRwLock<String>>,
-    account: Option<String>,
 }
 
 #[derive(Clone)]
@@ -72,12 +71,14 @@ impl Codex {
         .context("Codex app-server initialization failed")?;
         rpc.notify("initialized", json!({}))?;
 
-        let mut account = read_account(&rpc).await?;
-        if account.is_none() {
+        let mut authenticated = is_authenticated(&rpc).await?;
+        if !authenticated {
             login(&rpc).await?;
-            account = read_account(&rpc).await?;
+            authenticated = is_authenticated(&rpc).await?;
         }
-        let account = account.context("Codex login completed without an account")?;
+        if !authenticated {
+            bail!("Codex login completed without an account");
+        }
 
         let (models, default_model) = list_models(&rpc).await?;
         let model = default_model
@@ -95,7 +96,6 @@ impl Codex {
             models,
             selected_model: Arc::new(StdRwLock::new(model)),
             selected_reasoning_effort: Arc::new(StdRwLock::new(reasoning_effort)),
-            account: Some(account),
         })
     }
 
@@ -155,10 +155,6 @@ impl Codex {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = selected.clone();
         Ok(selected)
-    }
-
-    pub fn account(&self) -> Option<&str> {
-        self.account.as_deref()
     }
 
     pub async fn new_session(&self) -> Result<()> {
@@ -522,11 +518,11 @@ fn send_tool_error(writer: mpsc::WeakUnboundedSender<String>, id: Value, message
     }
 }
 
-async fn read_account(rpc: &Rpc) -> Result<Option<String>> {
+async fn is_authenticated(rpc: &Rpc) -> Result<bool> {
     let response = rpc
         .request("account/read", json!({ "refreshToken": false }))
         .await?;
-    Ok(response["account"]["email"].as_str().map(str::to_owned))
+    Ok(!response["account"].is_null())
 }
 
 async fn list_models(rpc: &Rpc) -> Result<(Vec<Model>, Option<Model>)> {

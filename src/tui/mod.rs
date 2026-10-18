@@ -1,4 +1,4 @@
-use std::{io, path::PathBuf};
+use std::{collections::HashMap, io, path::PathBuf};
 
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
@@ -82,16 +82,27 @@ impl StyleSheet for NonautMarkdown {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Role {
     You,
     Assistant,
     System,
+    Running,
+    Success,
+    Error,
 }
 
 struct Message {
     role: Role,
     content: String,
+}
+
+struct ToolSummary {
+    message_index: usize,
+    started: usize,
+    succeeded: usize,
+    failed: usize,
+    last_error: String,
 }
 
 struct ModelPicker {
@@ -139,6 +150,7 @@ pub struct App {
     request_generation: u64,
     queued_request: Option<String>,
     streaming_message: Option<usize>,
+    tool_summaries: HashMap<String, ToolSummary>,
     session_tokens: u64,
     conversation_scroll: u16,
     conversation_max_scroll: u16,
@@ -193,6 +205,7 @@ impl App {
             request_generation: 0,
             queued_request: None,
             streaming_message: None,
+            tool_summaries: HashMap::new(),
             session_tokens: 0,
             conversation_scroll: 0,
             conversation_max_scroll: 0,
@@ -333,6 +346,58 @@ impl App {
                         };
                         lines.push(Line::from(vec![
                             Span::styled(marker, Style::new().fg(ACCENT)),
+                            Span::styled(line, content_style),
+                        ]));
+                    }
+                    lines.push(Line::default());
+                }
+                Role::Running => {
+                    for (index, line) in message.content.lines().enumerate() {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                if index == 0 {
+                                    "· ".to_owned()
+                                } else {
+                                    "  ".to_owned()
+                                },
+                                Style::new().fg(ACCENT).bold(),
+                            ),
+                            Span::styled(line, Style::new().fg(MUTED)),
+                        ]));
+                    }
+                    lines.push(Line::default());
+                }
+                Role::Success => {
+                    for (index, line) in message.content.lines().enumerate() {
+                        let marker = if index == 0 { "◆ " } else { "  " };
+                        let content_style = if line.starts_with('+') && !line.starts_with("+++") {
+                            Style::new().fg(ADDED)
+                        } else if line.starts_with('-') && !line.starts_with("---") {
+                            Style::new().fg(REMOVED)
+                        } else if line.starts_with("@@") {
+                            Style::new().fg(ACCENT)
+                        } else if index == 0 {
+                            Style::new().fg(ADDED)
+                        } else {
+                            Style::new().fg(MUTED)
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(marker, Style::new().fg(ADDED).bold()),
+                            Span::styled(line, content_style),
+                        ]));
+                    }
+                    lines.push(Line::default());
+                }
+                Role::Error => {
+                    for (index, line) in message.content.lines().enumerate() {
+                        let marker = if index == 0 { "◆ " } else { "  " };
+                        let content_style = if index == 0 {
+                            Style::new().fg(REMOVED)
+                        } else {
+                            Style::new().fg(MUTED)
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(marker, Style::new().fg(REMOVED).bold()),
                             Span::styled(line, content_style),
                         ]));
                     }
@@ -825,6 +890,7 @@ impl App {
             "/clear" => {
                 self.messages.clear();
                 self.streaming_message = None;
+                self.tool_summaries.clear();
                 self.conversation_scroll = 0;
                 self.conversation_max_scroll = 0;
             }
@@ -968,6 +1034,7 @@ impl App {
             return;
         };
         self.streaming_message = None;
+        self.tool_summaries.clear();
         self.request_generation = self.request_generation.wrapping_add(1);
         let request_id = self.request_generation;
         let sender = self.events_tx.clone();
@@ -1046,7 +1113,6 @@ impl App {
         self.connection = None;
         match event {
             ConnectionEvent::Connected(_, provider, warning) => {
-                let identity = provider.account().unwrap_or("ChatGPT").to_owned();
                 let model = provider.model();
                 self.models = provider.models().to_vec();
                 self.model_id = model.id;
@@ -1056,8 +1122,8 @@ impl App {
                 self.provider = Some(provider);
                 self.restore_reasoning_for_model();
                 self.push(
-                    Role::System,
-                    format!("Connected as {identity}. Type /help for commands."),
+                    Role::Success,
+                    "Provider connected. Type /help for commands.",
                 );
                 if let Some(warning) = warning {
                     self.push(Role::System, warning);
@@ -1094,7 +1160,11 @@ impl App {
             ProviderEvent::Usage(tokens) => self.session_tokens = tokens,
             ProviderEvent::ToolStarted(tool) => {
                 self.streaming_message = None;
-                self.push(Role::System, format!("Running {tool} in nono…"));
+                if Self::compact_tool(&tool) {
+                    self.start_compact_tool(&tool);
+                } else {
+                    self.push(Role::Running, format!("Running {tool} in nono…"));
+                }
             }
             ProviderEvent::ToolFinished {
                 tool,
@@ -1102,22 +1172,30 @@ impl App {
                 output,
             } => {
                 self.streaming_message = None;
+                if Self::compact_tool(&tool) && self.finish_compact_tool(&tool, success, &output) {
+                    return;
+                }
+                if let Some(message) = self
+                    .messages
+                    .iter_mut()
+                    .rev()
+                    .find(|message| message.role == Role::Running)
+                {
+                    message.role = Role::System;
+                }
                 if success {
                     if matches!(tool.as_str(), "write_file" | "edit_file" | "delete_file")
                         && !output.trim().is_empty()
                     {
                         self.push(
-                            Role::System,
+                            Role::Success,
                             format!("Completed {tool}\n{}", output.trim_end()),
                         );
                     } else {
-                        self.push(Role::System, format!("Completed {tool}"));
+                        self.push(Role::Success, format!("Completed {tool}"));
                     }
                 } else {
-                    self.push(
-                        Role::System,
-                        format!("Failed {tool}\n{}", output.trim_end()),
-                    );
+                    self.push(Role::Error, format!("Failed {tool}\n{}", output.trim_end()));
                 }
             }
             ProviderEvent::Completed => {
@@ -1137,6 +1215,7 @@ impl App {
             ProviderEvent::SessionStarted => {
                 self.messages.clear();
                 self.streaming_message = None;
+                self.tool_summaries.clear();
                 self.session_tokens = 0;
                 self.request = None;
                 self.push(Role::System, "New session started.");
@@ -1158,6 +1237,100 @@ impl App {
     fn start_queued_request(&mut self) {
         if let Some(content) = self.queued_request.take() {
             self.begin_request(content);
+        }
+    }
+
+    fn compact_tool(tool: &str) -> bool {
+        matches!(tool, "read_file" | "list_directory")
+    }
+
+    fn start_compact_tool(&mut self, tool: &str) {
+        if let Some(summary) = self.tool_summaries.get_mut(tool) {
+            summary.started += 1;
+            if let Some(message) = self.messages.get_mut(summary.message_index) {
+                message.role = Role::Running;
+                message.content = Self::running_summary(tool, summary.started);
+            }
+            return;
+        }
+
+        let message_index = self.messages.len();
+        self.push(Role::Running, Self::running_summary(tool, 1));
+        self.tool_summaries.insert(
+            tool.to_owned(),
+            ToolSummary {
+                message_index,
+                started: 1,
+                succeeded: 0,
+                failed: 0,
+                last_error: String::new(),
+            },
+        );
+    }
+
+    fn finish_compact_tool(&mut self, tool: &str, success: bool, output: &str) -> bool {
+        let Some(summary) = self.tool_summaries.get_mut(tool) else {
+            return false;
+        };
+        if success {
+            summary.succeeded += 1;
+        } else {
+            summary.failed += 1;
+            summary.last_error = output.trim_end().to_owned();
+        }
+
+        let role = if summary.failed == 0 {
+            Role::Success
+        } else {
+            Role::Error
+        };
+        let content = Self::completed_summary(tool, summary);
+        if let Some(message) = self.messages.get_mut(summary.message_index) {
+            message.role = role;
+            message.content = content;
+        }
+        true
+    }
+
+    fn running_summary(tool: &str, count: usize) -> String {
+        let action = match tool {
+            "read_file" => "Reading files in nono…",
+            "list_directory" => "Listing directories in nono…",
+            _ => return format!("Running {tool} in nono…"),
+        };
+        if count == 1 {
+            action.to_owned()
+        } else {
+            format!("{action} ({count})")
+        }
+    }
+
+    fn completed_summary(tool: &str, summary: &ToolSummary) -> String {
+        let noun = match tool {
+            "read_file" => "file",
+            "list_directory" => "director",
+            _ => "call",
+        };
+        let succeeded = if tool == "list_directory" {
+            format!(
+                "Listed {} director{}",
+                summary.succeeded,
+                if summary.succeeded == 1 { "y" } else { "ies" }
+            )
+        } else {
+            format!(
+                "Read {} {noun}{}",
+                summary.succeeded,
+                if summary.succeeded == 1 { "" } else { "s" }
+            )
+        };
+        if summary.failed == 0 {
+            succeeded
+        } else {
+            format!(
+                "{succeeded} · {} failed\n{}",
+                summary.failed, summary.last_error
+            )
         }
     }
 
@@ -1212,6 +1385,70 @@ mod tests {
         let mut app = app_with_input("");
         app.handle_provider_event(0, ProviderEvent::Usage(12_345));
         assert_eq!(app.session_tokens, 12_345);
+    }
+
+    #[test]
+    fn tool_results_use_success_and_error_roles() {
+        let mut app = app_with_input("");
+        app.handle_provider_event(
+            0,
+            ProviderEvent::ToolFinished {
+                tool: "read_file".to_owned(),
+                success: true,
+                output: "contents".to_owned(),
+            },
+        );
+        assert_eq!(app.messages.last().unwrap().role, Role::Success);
+
+        app.handle_provider_event(
+            0,
+            ProviderEvent::ToolFinished {
+                tool: "read_file".to_owned(),
+                success: false,
+                output: "denied".to_owned(),
+            },
+        );
+        assert_eq!(app.messages.last().unwrap().role, Role::Error);
+    }
+
+    #[test]
+    fn running_tool_stops_animating_when_it_finishes() {
+        let mut app = app_with_input("");
+        app.handle_provider_event(0, ProviderEvent::ToolStarted("read_file".to_owned()));
+        assert_eq!(app.messages.last().unwrap().role, Role::Running);
+
+        app.handle_provider_event(
+            0,
+            ProviderEvent::ToolFinished {
+                tool: "read_file".to_owned(),
+                success: true,
+                output: String::new(),
+            },
+        );
+
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].role, Role::Success);
+        assert_eq!(app.messages[0].content, "Read 1 file");
+    }
+
+    #[test]
+    fn repeated_reads_share_one_counted_status() {
+        let mut app = app_with_input("");
+        for _ in 0..3 {
+            app.handle_provider_event(0, ProviderEvent::ToolStarted("read_file".to_owned()));
+            app.handle_provider_event(
+                0,
+                ProviderEvent::ToolFinished {
+                    tool: "read_file".to_owned(),
+                    success: true,
+                    output: String::new(),
+                },
+            );
+        }
+
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].role, Role::Success);
+        assert_eq!(app.messages[0].content, "Read 3 files");
     }
 
     #[test]

@@ -116,7 +116,7 @@ pub fn specs() -> Value {
                 "properties": {
                     "program": { "type": "string", "description": "Executable name, such as cargo, git, or sh." },
                     "args": { "type": "array", "items": { "type": "string" } },
-                    "cwd": { "type": "string", "description": "Optional workspace-relative working directory." },
+                    "cwd": { "type": "string", "description": "Optional working directory inside the workspace. Relative and absolute workspace paths are accepted." },
                     "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 120 }
                 },
                 "required": ["program", "args"],
@@ -133,7 +133,7 @@ pub async fn execute(workspace: &Path, tool: &str, arguments: &Value) -> Result<
     }
 
     let executable = std::env::current_exe().context("could not locate the Nonaut executable")?;
-    let mut child = sandbox_command(workspace, &executable);
+    let mut child = sandbox_command(workspace, workspace, &executable);
     child
         .arg("__nonaut_tool")
         .arg(tool)
@@ -195,6 +195,17 @@ fn normalize_tool_paths(workspace: &Path, tool: &str, arguments: &Value) -> Resu
                 *argument = Value::String(expand_tildes_in_command_argument(raw, &home));
             }
         }
+    }
+    if tool == "run_command"
+        && let Some(cwd) = expanded.get_mut("cwd")
+        && let Some(raw) = cwd.as_str()
+    {
+        let expanded_path = expand_tilde_with_home(raw, &home);
+        *cwd = Value::String(
+            normalize_path(workspace, &expanded_path)?
+                .to_string_lossy()
+                .into(),
+        );
     }
 
     Ok(expanded)
@@ -279,8 +290,8 @@ fn is_shell_word_start(previous: Option<char>) -> bool {
 
 async fn run_command(workspace: &Path, arguments: &Value) -> Result<String> {
     let program = required_string(arguments, "program")?;
-    if program.contains('/') || program.contains('\\') || program.trim().is_empty() {
-        bail!("program must be a bare executable name resolved through PATH");
+    if program.trim().is_empty() {
+        bail!("program may not be empty");
     }
     let args = arguments["args"]
         .as_array()
@@ -293,20 +304,16 @@ async fn run_command(workspace: &Path, arguments: &Value) -> Result<String> {
                 .context("every command argument must be a string")
         })
         .collect::<Result<Vec<_>>>()?;
-    let command_cwd = optional_string(arguments, "cwd")?.unwrap_or(".");
-    let command_cwd = checked_workspace_path(workspace, command_cwd)?;
-    if !command_cwd.is_dir() {
-        bail!("command cwd is not a directory");
-    }
+    let command_cwd = optional_string(arguments, "cwd")
+        .map(|cwd| cwd.unwrap_or_else(|| workspace.to_str().unwrap_or(".")))?;
     let timeout = arguments["timeout_seconds"]
         .as_u64()
         .unwrap_or(120)
         .clamp(1, 120);
 
-    let mut command = sandbox_command(workspace, Path::new(program));
+    let mut command = sandbox_command(workspace, Path::new(command_cwd), Path::new(program));
     command
         .args(args)
-        .current_dir(command_cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -320,7 +327,7 @@ async fn run_command(workspace: &Path, arguments: &Value) -> Result<String> {
     output_result(program, output)
 }
 
-fn sandbox_command(workspace: &Path, program: &Path) -> Command {
+fn sandbox_command(workspace: &Path, workdir: &Path, program: &Path) -> Command {
     let mut command = Command::new(nono_executable());
     command
         .arg("run")
@@ -331,7 +338,7 @@ fn sandbox_command(workspace: &Path, program: &Path) -> Command {
         .arg("--allow")
         .arg(workspace)
         .arg("--workdir")
-        .arg(workspace)
+        .arg(workdir)
         .arg("--block-net")
         .arg("--")
         .arg("/usr/bin/env")
@@ -422,6 +429,7 @@ fn is_sandbox_denial(output: &str) -> bool {
         "sandbox-denied",
         "PolicyBlocked",
         "sandbox_denied_path",
+        "CWD access requires --allow-cwd",
     ]
     .iter()
     .any(|marker| output.contains(marker))
@@ -732,41 +740,9 @@ fn requested_path(workspace: &Path, raw: &str) -> Result<PathBuf> {
     }
 }
 
-fn checked_workspace_path(workspace: &Path, raw: &str) -> Result<PathBuf> {
-    let relative = Path::new(raw);
-    if relative.as_os_str().is_empty() || relative.is_absolute() {
-        bail!("command cwd must be workspace-relative");
-    }
-    if relative.components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
-        bail!("command cwd may not escape the workspace");
-    }
-    let workspace = workspace
-        .canonicalize()
-        .context("could not resolve workspace")?;
-    let path = workspace
-        .join(relative)
-        .canonicalize()
-        .context("command cwd does not exist")?;
-    if !path.starts_with(&workspace) {
-        bail!("path resolves outside the workspace");
-    }
-    Ok(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn command_cwd_rejects_parent_traversal() {
-        let workspace = std::env::current_dir().unwrap();
-        assert!(checked_workspace_path(&workspace, "../secret").is_err());
-    }
 
     #[test]
     fn requested_paths_are_left_for_nono_to_enforce() {
@@ -799,6 +775,18 @@ mod tests {
             normalize_path(workspace, "../../.ssh/config").unwrap(),
             PathBuf::from("/Users/example/.ssh/config")
         );
+    }
+
+    #[test]
+    fn command_cwd_is_normalized_without_policy_enforcement() {
+        let workspace = Path::new("/Users/example/Work/nonaut");
+        let arguments = json!({
+            "program": "ls",
+            "args": ["."],
+            "cwd": "/Users/example/.ssh"
+        });
+        let normalized = normalize_tool_paths(workspace, "run_command", &arguments).unwrap();
+        assert_eq!(normalized["cwd"], "/Users/example/.ssh");
     }
 
     #[test]
@@ -845,6 +833,9 @@ mod tests {
     fn recognizes_sandbox_denial_messages() {
         assert!(is_sandbox_denial("ls: secret: Operation not permitted"));
         assert!(is_sandbox_denial("reason: PolicyBlocked"));
+        assert!(is_sandbox_denial(
+            "nono: CWD access requires --allow-cwd in non-interactive mode"
+        ));
         assert!(!is_sandbox_denial("cargo test exited with status 1"));
     }
 
