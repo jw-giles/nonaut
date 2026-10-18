@@ -1,49 +1,21 @@
-use std::{fs, io::ErrorKind, path::PathBuf};
+use std::{
+    fs,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde_json::{Map, Value};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProviderKind {
-    Codex,
-}
-
-impl ProviderKind {
-    pub const ALL: [Self; 1] = [Self::Codex];
-
-    pub const fn id(self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-        }
-    }
-
-    pub const fn display_name(self) -> &'static str {
-        match self {
-            Self::Codex => "Codex / ChatGPT",
-        }
-    }
-
-    pub const fn description(self) -> &'static str {
-        match self {
-            Self::Codex => "Existing Codex account · tools isolated by nono",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self> {
-        match value.trim() {
-            "codex" => Ok(Self::Codex),
-            value => bail!("unknown saved provider `{value}`"),
-        }
-    }
-}
+use crate::providers::ProviderKind;
 
 pub fn load_default_provider() -> Result<Option<ProviderKind>> {
     let path = provider_path()?;
-    match fs::read_to_string(&path) {
-        Ok(value) => ProviderKind::parse(&value).map(Some),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("could not read {}", path.display())),
+    let legacy = legacy_path("provider")?;
+    match read_config(&path, &legacy)? {
+        Some((_, value)) => ProviderKind::parse(&value).map(Some),
+        None => Ok(None),
     }
 }
 
@@ -53,8 +25,9 @@ pub fn save_default_provider(provider: ProviderKind) -> Result<()> {
 
 pub fn load_model(provider: ProviderKind) -> Result<Option<String>> {
     let path = model_path(provider)?;
-    match fs::read_to_string(&path) {
-        Ok(value) => {
+    let legacy = legacy_path(&format!("model-{}", provider.id()))?;
+    match read_config(&path, &legacy)? {
+        Some((_, value)) => {
             let model = value.trim();
             if model.is_empty() {
                 Ok(None)
@@ -62,8 +35,7 @@ pub fn load_model(provider: ProviderKind) -> Result<Option<String>> {
                 Ok(Some(model.to_owned()))
             }
         }
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("could not read {}", path.display())),
+        None => Ok(None),
     }
 }
 
@@ -73,26 +45,22 @@ pub fn save_model(provider: ProviderKind, model: &str) -> Result<()> {
 
 pub fn load_reasoning(provider: ProviderKind, model: &str) -> Result<Option<String>> {
     let path = reasoning_path(provider)?;
-    let values = match fs::read_to_string(&path) {
-        Ok(value) => serde_json::from_str::<Map<String, Value>>(&value)
-            .with_context(|| format!("could not parse {}", path.display()))?,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("could not read {}", path.display()));
-        }
+    let legacy = legacy_path(&format!("reasoning-{}.json", provider.id()))?;
+    let values = match read_config(&path, &legacy)? {
+        Some((source, value)) => serde_json::from_str::<Map<String, Value>>(&value)
+            .with_context(|| format!("could not parse {}", source.display()))?,
+        None => return Ok(None),
     };
     Ok(values.get(model).and_then(Value::as_str).map(str::to_owned))
 }
 
 pub fn save_reasoning(provider: ProviderKind, model: &str, effort: &str) -> Result<()> {
     let path = reasoning_path(provider)?;
-    let mut values = match fs::read_to_string(&path) {
-        Ok(value) => serde_json::from_str::<Map<String, Value>>(&value)
-            .with_context(|| format!("could not parse {}", path.display()))?,
-        Err(error) if error.kind() == ErrorKind::NotFound => Map::new(),
-        Err(error) => {
-            return Err(error).with_context(|| format!("could not read {}", path.display()));
-        }
+    let legacy = legacy_path(&format!("reasoning-{}.json", provider.id()))?;
+    let mut values = match read_config(&path, &legacy)? {
+        Some((source, value)) => serde_json::from_str::<Map<String, Value>>(&value)
+            .with_context(|| format!("could not parse {}", source.display()))?,
+        None => Map::new(),
     };
     values.insert(model.to_owned(), Value::String(effort.to_owned()));
     let encoded =
@@ -110,26 +78,46 @@ fn write_config(path: PathBuf, value: &str) -> Result<()> {
         .with_context(|| format!("could not save {}", path.display()))
 }
 
+fn read_config(path: &Path, legacy: &Path) -> Result<Option<(PathBuf, String)>> {
+    match fs::read_to_string(path) {
+        Ok(value) => Ok(Some((path.to_path_buf(), value))),
+        Err(error) if error.kind() == ErrorKind::NotFound => match fs::read_to_string(legacy) {
+            Ok(value) => Ok(Some((legacy.to_path_buf(), value))),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => {
+                Err(error).with_context(|| format!("could not read {}", legacy.display()))
+            }
+        },
+        Err(error) => Err(error).with_context(|| format!("could not read {}", path.display())),
+    }
+}
+
 fn provider_path() -> Result<PathBuf> {
-    let project = ProjectDirs::from("ai", "nolabs", "whoa")
-        .context("could not determine the Whoa configuration directory")?;
+    let project = ProjectDirs::from("ai", "nolabs", "nonaut")
+        .context("could not determine the Nonaut configuration directory")?;
     Ok(project.config_dir().join("provider"))
 }
 
 fn model_path(provider: ProviderKind) -> Result<PathBuf> {
-    let project = ProjectDirs::from("ai", "nolabs", "whoa")
-        .context("could not determine the Whoa configuration directory")?;
+    let project = ProjectDirs::from("ai", "nolabs", "nonaut")
+        .context("could not determine the Nonaut configuration directory")?;
     Ok(project
         .config_dir()
         .join(format!("model-{}", provider.id())))
 }
 
 fn reasoning_path(provider: ProviderKind) -> Result<PathBuf> {
-    let project = ProjectDirs::from("ai", "nolabs", "whoa")
-        .context("could not determine the Whoa configuration directory")?;
+    let project = ProjectDirs::from("ai", "nolabs", "nonaut")
+        .context("could not determine the Nonaut configuration directory")?;
     Ok(project
         .config_dir()
         .join(format!("reasoning-{}.json", provider.id())))
+}
+
+fn legacy_path(name: &str) -> Result<PathBuf> {
+    let project = ProjectDirs::from("ai", "nolabs", "whoa")
+        .context("could not determine the legacy configuration directory")?;
+    Ok(project.config_dir().join(name))
 }
 
 #[cfg(test)]

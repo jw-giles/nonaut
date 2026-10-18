@@ -16,10 +16,8 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tui_markdown::{Options as MarkdownOptions, StyleSheet, from_str_with_options};
 
 use crate::{
-    config::{
-        ProviderKind, load_model, load_reasoning, save_default_provider, save_model, save_reasoning,
-    },
-    provider::{Codex, Model, ProviderEvent, ReasoningOption},
+    config::{load_model, load_reasoning, save_default_provider, save_model, save_reasoning},
+    providers::{Model, Provider, ProviderEvent, ProviderKind, ReasoningOption},
 };
 
 const BACKGROUND: Color = Color::Rgb(17, 17, 16);
@@ -32,9 +30,9 @@ const ADDED: Color = Color::Rgb(126, 198, 153);
 const REMOVED: Color = Color::Rgb(224, 108, 117);
 
 #[derive(Clone, Copy)]
-struct WhoaMarkdown;
+struct NonautMarkdown;
 
-impl StyleSheet for WhoaMarkdown {
+impl StyleSheet for NonautMarkdown {
     fn heading(&self, _level: u8) -> Style {
         Style::new().fg(ACCENT).bold()
     }
@@ -112,7 +110,7 @@ struct ProviderPicker {
 }
 
 enum ConnectionEvent {
-    Connected(u64, Codex, Option<String>),
+    Connected(u64, Provider, Option<String>),
     Failed(u64, String),
 }
 
@@ -120,7 +118,7 @@ pub struct App {
     input: TextArea<'static>,
     messages: Vec<Message>,
     cwd: PathBuf,
-    provider: Option<Codex>,
+    provider: Option<Provider>,
     active_provider: Option<ProviderKind>,
     provider_name: String,
     models: Vec<Model>,
@@ -279,7 +277,7 @@ impl App {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("  ◆ ", Style::new().fg(ACCENT).bold()),
-                Span::styled("whoa", Style::new().fg(FOREGROUND).bold()),
+                Span::styled("nonaut", Style::new().fg(FOREGROUND).bold()),
                 Span::styled(" — security-first agent harness", Style::new().fg(MUTED)),
             ]))
             .style(Style::new().bg(BACKGROUND)),
@@ -310,7 +308,7 @@ impl App {
                     lines.push(Line::default());
                 }
                 Role::Assistant => {
-                    let options = MarkdownOptions::new(WhoaMarkdown)
+                    let options = MarkdownOptions::new(NonautMarkdown)
                         .table_width(conversation.width.saturating_sub(4));
                     let rendered = from_str_with_options(&message.content, &options);
                     lines.extend(rendered.lines);
@@ -836,7 +834,7 @@ impl App {
             "/new" => self.begin_new_session(),
             "/help" => self.push(
                 Role::System,
-                "/help       show this message\n/provider   choose or reconnect a provider\n/model      choose a provider model\n/reasoning  choose model reasoning effort\n/new        start a fresh session\n/clear      clear the screen\n/q, /quit   leave whoa",
+                "/help       show this message\n/provider   choose or reconnect a provider\n/model      choose a provider model\n/reasoning  choose model reasoning effort\n/new        start a fresh session\n/clear      clear the screen\n/q, /quit   leave nonaut",
             ),
             _ if self.request.is_some() => {
                 self.queued_request = Some(content);
@@ -1020,20 +1018,18 @@ impl App {
             ),
         );
         self.connection = Some(tokio::spawn(async move {
-            let event = match provider {
-                ProviderKind::Codex => match Codex::connect(&cwd).await {
-                    Ok(provider) => {
-                        let warning = saved_model.and_then(|model| {
-                            provider.select_model(&model).err().map(|_| {
-                                format!(
-                                    "Saved model `{model}` is no longer available; using the provider default."
-                                )
-                            })
-                        });
-                        ConnectionEvent::Connected(generation, provider, warning)
-                    }
-                    Err(error) => ConnectionEvent::Failed(generation, format!("{error:#}")),
-                },
+            let event = match Provider::connect(provider, &cwd).await {
+                Ok(provider) => {
+                    let warning = saved_model.and_then(|model| {
+                        provider.select_model(&model).err().map(|_| {
+                            format!(
+                                "Saved model `{model}` is no longer available; using the provider default."
+                            )
+                        })
+                    });
+                    ConnectionEvent::Connected(generation, provider, warning)
+                }
+                Err(error) => ConnectionEvent::Failed(generation, format!("{error:#}")),
             };
             let _ = sender.send(event);
         }));
@@ -1281,7 +1277,7 @@ mod tests {
 
     #[test]
     fn markdown_code_blocks_hide_literal_fences() {
-        let options = MarkdownOptions::new(WhoaMarkdown);
+        let options = MarkdownOptions::new(NonautMarkdown);
         let rendered = from_str_with_options("```text\npermission denied\n```", &options);
         let visible = rendered.to_string();
         assert!(visible.contains("permission denied"));

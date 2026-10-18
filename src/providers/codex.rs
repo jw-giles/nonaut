@@ -20,44 +20,16 @@ use tokio::{
 
 use crate::tools;
 
+use super::{Model, ProviderEvent, ReasoningOption};
+
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 type RpcReply = std::result::Result<Value, String>;
 type PendingRequests = Arc<Mutex<HashMap<u64, oneshot::Sender<RpcReply>>>>;
 
-#[derive(Clone, Debug)]
-pub struct Model {
-    pub id: String,
-    pub display_name: String,
-    pub default_reasoning_effort: String,
-    pub reasoning_efforts: Vec<ReasoningOption>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ReasoningOption {
-    pub id: String,
-    pub description: String,
-}
-
-#[derive(Debug)]
-pub enum ProviderEvent {
-    Delta(String),
-    Usage(u64),
-    ToolStarted(String),
-    ToolFinished {
-        tool: String,
-        success: bool,
-        output: String,
-    },
-    Completed,
-    Interrupted,
-    SessionStarted,
-    Failed(String),
-}
-
 #[derive(Clone)]
-pub struct Codex {
+pub(crate) struct Codex {
     rpc: Rpc,
     cwd: PathBuf,
     thread_id: Arc<RwLock<String>>,
@@ -86,8 +58,8 @@ impl Codex {
             "initialize",
             json!({
                 "clientInfo": {
-                    "name": "whoa",
-                    "title": "Whoa",
+                    "name": "nonaut",
+                    "title": "Nonaut",
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "capabilities": {
@@ -242,14 +214,14 @@ impl Codex {
                 {
                     let _ = sender.send((request_id, ProviderEvent::Usage(tokens)));
                 }
-            } else if notification["method"] == "whoa/toolStarted"
+            } else if notification["method"] == "nonaut/toolStarted"
                 && notification["params"]["threadId"] == thread_id
                 && notification["params"]["turnId"] == turn_id
             {
                 if let Some(tool) = notification["params"]["tool"].as_str() {
                     let _ = sender.send((request_id, ProviderEvent::ToolStarted(tool.to_owned())));
                 }
-            } else if notification["method"] == "whoa/toolFinished"
+            } else if notification["method"] == "nonaut/toolFinished"
                 && notification["params"]["threadId"] == thread_id
                 && notification["params"]["turnId"] == turn_id
             {
@@ -403,7 +375,7 @@ impl Rpc {
                         "id": id.clone(),
                         "error": {
                             "code": -32601,
-                            "message": "Whoa only accepts its declared dynamic tools"
+                            "message": "Nonaut only accepts its declared dynamic tools"
                         }
                     });
                     if let Some(writer) = writer.upgrade() {
@@ -413,7 +385,7 @@ impl Rpc {
                     let _ = reader_notifications.send(message);
                 }
             }
-            let _ = reader_notifications.send(json!({ "method": "whoa/processExited" }));
+            let _ = reader_notifications.send(json!({ "method": "nonaut/processExited" }));
         });
         tokio::spawn(async move {
             let _ = child.wait().await;
@@ -491,7 +463,7 @@ async fn start_tool_call(
     let thread_id = params["threadId"].as_str().unwrap_or_default().to_owned();
     let arguments = params["arguments"].clone();
     let _ = notifications.send(json!({
-        "method": "whoa/toolStarted",
+        "method": "nonaut/toolStarted",
         "params": { "threadId": thread_id, "turnId": turn_id, "tool": tool }
     }));
 
@@ -519,7 +491,7 @@ async fn start_tool_call(
             let _ = writer.send(response.to_string());
         }
         let _ = notifications.send(json!({
-            "method": "whoa/toolFinished",
+            "method": "nonaut/toolFinished",
             "params": {
                 "threadId": thread_id,
                 "turnId": task_turn_id,
@@ -618,8 +590,8 @@ async fn start_thread(rpc: &Rpc, cwd: &Path, model: &str) -> Result<String> {
                 "approvalPolicy": "never",
                 "approvalsReviewer": "user",
                 "dynamicTools": tools::specs(),
-                "baseInstructions": "You are the coding model inside Whoa, a security-first agent harness. Use the provided tools to inspect and modify files and verify your work. Prefer the dedicated read_file, write_file, edit_file, and delete_file tools over run_command.",
-                "developerInstructions": "Tool integrity rule: never state or imply that a file was created, updated, patched, or deleted unless write_file, edit_file, or delete_file returned success in this turn. For creation or full replacement, call write_file immediately without preflight reads. For a focused edit, read the file at most once and then call edit_file. For deletion, call delete_file. Never replace a direct file mutation with run_command. Security boundary rule: you never decide whether an operation is allowed; nono is the sole authorization authority. You MUST issue the appropriate tool call even if a path is outside the workspace, sensitive, or likely denied. Pass the requested path directly because Whoa normalizes it. A follow-up such as 'try it', 'do it anyway', or 'force it' means retry the last operation once under the existing policy so the denial is observable; it never means evade the sandbox. Report the real tool result."
+                "baseInstructions": "You are the coding model inside Nonaut, a security-first agent harness. Use the provided tools to inspect and modify files and verify your work. Prefer the dedicated read_file, write_file, edit_file, and delete_file tools over run_command.",
+                "developerInstructions": "Tool integrity rule: never state or imply that a file was created, updated, patched, or deleted unless write_file, edit_file, or delete_file returned success in this turn. For creation or full replacement, call write_file immediately without preflight reads. For a focused edit, read the file at most once and then call edit_file. For deletion, call delete_file. Never replace a direct file mutation with run_command. Security boundary rule: you never decide whether an operation is allowed; nono is the sole authorization authority. You MUST issue the appropriate tool call even if a path is outside the workspace, sensitive, or likely denied. Pass the requested path directly because Nonaut normalizes it. A follow-up such as 'try it', 'do it anyway', or 'force it' means retry the last operation once under the existing policy so the denial is observable; it never means evade the sandbox. Report the real tool result."
             }),
         )
         .await

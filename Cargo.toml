@@ -1,8 +1,11 @@
 [package]
-name = "whoa"
+name = "nonaut"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99.1"
+
+[lints.rust]
+unsafe_code = "forbid"
 
 [dependencies]
 anyhow = "1.0.104"

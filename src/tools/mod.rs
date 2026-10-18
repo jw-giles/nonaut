@@ -56,7 +56,7 @@ pub fn specs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "File path to attempt. Relative paths start at the workspace; Whoa normalizes it and nono enforces access." },
+                    "path": { "type": "string", "description": "File path to attempt. Relative paths start at the workspace; Nonaut normalizes it and nono enforces access." },
                     "content": { "type": "string", "description": "Complete replacement file contents." }
                 },
                 "required": ["path", "content"],
@@ -132,10 +132,10 @@ pub async fn execute(workspace: &Path, tool: &str, arguments: &Value) -> Result<
         return run_command(workspace, &arguments).await;
     }
 
-    let executable = std::env::current_exe().context("could not locate the Whoa executable")?;
+    let executable = std::env::current_exe().context("could not locate the Nonaut executable")?;
     let mut child = sandbox_command(workspace, &executable);
     child
-        .arg("__whoa_tool")
+        .arg("__nonaut_tool")
         .arg(tool)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -435,7 +435,7 @@ fn truncate(value: &str) -> String {
     while !value.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}\n[output truncated by Whoa]", &value[..end])
+    format!("{}\n[output truncated by Nonaut]", &value[..end])
 }
 
 pub fn run_worker() -> Result<()> {
@@ -699,7 +699,7 @@ fn truncate_diff(diff: &str) -> String {
         output.push('\n');
     }
     if truncated {
-        output.push_str("… diff truncated by Whoa\n");
+        output.push_str("… diff truncated by Nonaut\n");
     }
     output.trim_end().to_owned()
 }
@@ -783,18 +783,18 @@ mod tests {
 
     #[test]
     fn structured_tool_paths_are_absolute_and_lexically_normalized() {
-        let workspace = Path::new("/Users/example/Work/whoa");
+        let workspace = Path::new("/Users/example/Work/nonaut");
         let arguments = json!({ "path": "./src/../test.md" });
         let normalized = normalize_tool_paths(workspace, "read_file", &arguments).unwrap();
         assert_eq!(
             normalized["path"],
-            Value::String("/Users/example/Work/whoa/test.md".to_owned())
+            Value::String("/Users/example/Work/nonaut/test.md".to_owned())
         );
     }
 
     #[test]
     fn normalization_does_not_restrict_paths_before_nono() {
-        let workspace = Path::new("/Users/example/Work/whoa");
+        let workspace = Path::new("/Users/example/Work/nonaut");
         assert_eq!(
             normalize_path(workspace, "../../.ssh/config").unwrap(),
             PathBuf::from("/Users/example/.ssh/config")
@@ -857,9 +857,12 @@ mod tests {
 
     #[test]
     fn workspace_paths_are_shortened_for_display() {
-        let workspace = Path::new("/Users/example/Work/whoa");
+        let workspace = Path::new("/Users/example/Work/nonaut");
         assert_eq!(
-            display_path(workspace, Path::new("/Users/example/Work/whoa/src/main.rs")),
+            display_path(
+                workspace,
+                Path::new("/Users/example/Work/nonaut/src/main.rs")
+            ),
             "src/main.rs"
         );
         assert_eq!(
