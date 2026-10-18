@@ -160,7 +160,7 @@ Running the command again downloads and rebuilds the latest source.
 
 ## Releases
 
-Push a version tag matching `Cargo.toml`, such as `v0.0.1`, to publish signed
+Push a version tag matching `Cargo.toml`, such as `v0.0.2`, to publish signed
 build provenance, checksums, and binaries for Linux and macOS on x86_64 and
 ARM64.
 
