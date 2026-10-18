@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
 };
 use ratatui_textarea::TextArea;
 use tokio::{
@@ -71,6 +71,9 @@ static PALETTE: LazyLock<Palette> = LazyLock::new(|| {
 // Driven by the event loop, not the terminal, so a frozen app stops blinking.
 const CURSOR_BLINK: Duration = Duration::from_millis(530);
 const BRAND_MARK: &str = "⎔";
+// The prompt starts two lines tall and grows with newlines up to this many.
+const PROMPT_MIN_LINES: usize = 2;
+const PROMPT_MAX_LINES: usize = 10;
 
 #[derive(Clone, Copy)]
 struct SlashCommand {
@@ -376,15 +379,7 @@ impl App {
 
     fn new_input() -> TextArea<'static> {
         let mut input = TextArea::default();
-        input.set_block(
-            Block::new()
-                .borders(Borders::ALL)
-                .border_style(Style::new().fg(PALETTE.accent))
-                .style(Style::new().bg(PALETTE.background))
-                .title(Line::from(" prompt ").style(Style::new().fg(PALETTE.accent).bold()))
-                // Border plus padding puts typed text in the same column as message text.
-                .padding(Padding::new(4, 1, 0, 0)),
-        );
+        input.set_block(Self::prompt_block(0));
         input.set_style(Style::new().fg(PALETTE.foreground).bg(PALETTE.background));
         input.set_cursor_line_style(Style::new().bg(PALETTE.background));
         input.set_cursor_style(Style::new().bg(PALETTE.accent).fg(PALETTE.background));
@@ -393,16 +388,44 @@ impl App {
         input
     }
 
+    /// Rounded prompt with the token count in the top border and the key
+    /// hints in the bottom border, so no separate footer row is needed.
+    fn prompt_block(tokens: u64) -> Block<'static> {
+        let key = Style::new().fg(PALETTE.foreground);
+        let label = Style::new().fg(PALETTE.muted);
+        Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(PALETTE.accent))
+            .style(Style::new().bg(PALETTE.background))
+            .title_top(Line::styled(" › ", Style::new().fg(PALETTE.accent).bold()))
+            .title_top(Line::styled(format!(" {tokens} tokens "), label).right_aligned())
+            .title_bottom(Line::from(vec![
+                Span::styled(" Enter", key),
+                Span::styled(" send · ", label),
+                Span::styled("Shift+Enter", key),
+                Span::styled(" newline · ", label),
+                Span::styled("/q", key),
+                Span::styled(" quit ", label),
+            ]))
+            // Border plus padding puts typed text in the same column as message text.
+            .padding(Padding::new(4, 1, 0, 0))
+    }
+
     fn render(&mut self, frame: &mut Frame) {
         frame.render_widget(
             Block::new().style(Style::new().bg(PALETTE.background)),
             frame.area(),
         );
-        let [header, conversation, prompt, footer] = Layout::vertical([
+        let prompt_lines = self
+            .input
+            .lines()
+            .len()
+            .clamp(PROMPT_MIN_LINES, PROMPT_MAX_LINES);
+        let [header, conversation, prompt] = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(5),
-            Constraint::Length(1),
+            Constraint::Length(u16::try_from(prompt_lines + 2).unwrap_or(u16::MAX)),
         ])
         .areas(frame.area());
         frame.render_widget(
@@ -420,8 +443,6 @@ impl App {
         .areas(header);
         let [brand, status] =
             Layout::horizontal([Constraint::Length(46), Constraint::Min(1)]).areas(header_content);
-        let [controls, usage] =
-            Layout::horizontal([Constraint::Min(1), Constraint::Length(20)]).areas(footer);
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
                 format!("  {BRAND_MARK}  nonaut"),
@@ -524,25 +545,9 @@ impl App {
         } else {
             Style::new().fg(PALETTE.foreground).bg(PALETTE.background)
         });
+        self.input
+            .set_block(Self::prompt_block(self.session_tokens));
         frame.render_widget(&self.input, prompt);
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("   Enter", Style::new().fg(PALETTE.foreground)),
-                Span::styled(" send   ", Style::new().fg(PALETTE.muted)),
-                Span::styled("Shift+Enter", Style::new().fg(PALETTE.foreground)),
-                Span::styled(" newline   ", Style::new().fg(PALETTE.muted)),
-                Span::styled("/q", Style::new().fg(PALETTE.foreground)),
-                Span::styled(" quit", Style::new().fg(PALETTE.muted)),
-            ]))
-            .style(Style::new().bg(PALETTE.background)),
-            controls,
-        );
-        frame.render_widget(
-            Paragraph::new(format!("{} tokens  ", self.session_tokens))
-                .alignment(Alignment::Right)
-                .style(Style::new().fg(PALETTE.muted).bg(PALETTE.background)),
-            usage,
-        );
         if self.model_picker.is_none()
             && self.reasoning_picker.is_none()
             && self.provider_picker.is_none()
@@ -1660,6 +1665,22 @@ mod tests {
         app.input.insert_str(value);
         app
     }
+    #[test]
+    fn prompt_grows_with_newlines_between_min_and_max() {
+        fn prompt_rows(value: &str) -> u16 {
+            let mut app = app_with_input(value);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 40)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let top = (0..40).find(|&y| buffer[(0, y)].symbol() == "╭").unwrap();
+            40 - top
+        }
+        assert_eq!(prompt_rows("one line"), 4);
+        assert_eq!(prompt_rows("a\nb\nc\nd"), 6);
+        assert_eq!(prompt_rows(&"line\n".repeat(20)), 12);
+    }
+
     #[test]
     fn submitting_text_adds_local_shell_messages() {
         let mut app = app_with_input("hello");
