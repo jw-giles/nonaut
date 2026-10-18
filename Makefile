@@ -1,6 +1,8 @@
 .DEFAULT_GOAL := check
 
-.PHONY: check fmt fmt-check lint script-check test integration build smoke run clean
+.PHONY: ci check fmt fmt-check lint script-check test integration build smoke run clean
+
+ci: check integration smoke
 
 check: fmt-check lint script-check test
 

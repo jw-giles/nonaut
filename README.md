@@ -120,6 +120,7 @@ Development commands:
 
 | Command | Action |
 | --- | --- |
+| `make ci` | Run the complete local CI suite |
 | `make run` | Build an optimized binary and launch Nonaut |
 | `make build` | Build the optimized binary |
 | `make check` | Check formatting, run Clippy, and run unit tests |
@@ -134,9 +135,7 @@ Development commands:
 Before opening a pull request, run:
 
 ```sh
-make check
-make integration
-make smoke
+make ci
 ```
 
 The integration suite does not connect to a provider or consume model tokens.
