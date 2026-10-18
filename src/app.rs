@@ -1,0 +1,1360 @@
+use std::{io, path::PathBuf};
+
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+};
+use futures_util::StreamExt;
+use ratatui::{
+    DefaultTerminal, Frame,
+    layout::{Alignment, Constraint, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
+};
+use ratatui_textarea::TextArea;
+use tokio::{sync::mpsc, task::JoinHandle};
+use tui_markdown::{Options as MarkdownOptions, StyleSheet, from_str_with_options};
+
+use crate::{
+    config::{
+        ProviderKind, load_model, load_reasoning, save_default_provider, save_model, save_reasoning,
+    },
+    provider::{Codex, Model, ProviderEvent, ReasoningOption},
+};
+
+const BACKGROUND: Color = Color::Rgb(17, 17, 16);
+const SURFACE: Color = Color::Rgb(25, 25, 24);
+const FOREGROUND: Color = Color::Rgb(232, 232, 232);
+const MUTED: Color = Color::Rgb(136, 136, 136);
+const BORDER: Color = Color::Rgb(50, 50, 49);
+const ACCENT: Color = Color::Rgb(232, 115, 74);
+const ADDED: Color = Color::Rgb(126, 198, 153);
+const REMOVED: Color = Color::Rgb(224, 108, 117);
+
+#[derive(Clone, Copy)]
+struct WhoaMarkdown;
+
+impl StyleSheet for WhoaMarkdown {
+    fn heading(&self, _level: u8) -> Style {
+        Style::new().fg(ACCENT).bold()
+    }
+
+    fn code(&self) -> Style {
+        Style::new().fg(FOREGROUND).bg(SURFACE)
+    }
+
+    fn link(&self) -> Style {
+        Style::new().fg(ACCENT).underlined()
+    }
+
+    fn blockquote(&self) -> Style {
+        Style::new().fg(MUTED).italic()
+    }
+
+    fn heading_meta(&self) -> Style {
+        Style::new().fg(MUTED)
+    }
+
+    fn metadata_block(&self) -> Style {
+        Style::new().fg(MUTED)
+    }
+
+    fn code_block_fence(&self) -> &str {
+        ""
+    }
+
+    fn html(&self) -> Style {
+        Style::new().fg(MUTED)
+    }
+
+    fn table_header(&self) -> Style {
+        Style::new().fg(ACCENT).bold()
+    }
+
+    fn table_cell(&self) -> Style {
+        Style::new().fg(FOREGROUND)
+    }
+
+    fn table_border(&self) -> Style {
+        Style::new().fg(BORDER)
+    }
+
+    fn list_marker(&self) -> Style {
+        Style::new().fg(ACCENT)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Role {
+    You,
+    Assistant,
+    System,
+}
+
+struct Message {
+    role: Role,
+    content: String,
+}
+
+struct ModelPicker {
+    models: Vec<Model>,
+    selected: usize,
+}
+
+struct ReasoningPicker {
+    options: Vec<ReasoningOption>,
+    selected: usize,
+}
+
+struct ProviderPicker {
+    providers: Vec<ProviderKind>,
+    selected: usize,
+}
+
+enum ConnectionEvent {
+    Connected(u64, Codex, Option<String>),
+    Failed(u64, String),
+}
+
+pub struct App {
+    input: TextArea<'static>,
+    messages: Vec<Message>,
+    cwd: PathBuf,
+    provider: Option<Codex>,
+    active_provider: Option<ProviderKind>,
+    provider_name: String,
+    models: Vec<Model>,
+    model_id: String,
+    model_name: String,
+    reasoning_effort: String,
+    reasoning_options: Vec<ReasoningOption>,
+    model_picker: Option<ModelPicker>,
+    reasoning_picker: Option<ReasoningPicker>,
+    provider_picker: Option<ProviderPicker>,
+    events_tx: mpsc::UnboundedSender<(u64, ProviderEvent)>,
+    events_rx: mpsc::UnboundedReceiver<(u64, ProviderEvent)>,
+    connection_tx: mpsc::UnboundedSender<ConnectionEvent>,
+    connection_rx: mpsc::UnboundedReceiver<ConnectionEvent>,
+    connection: Option<JoinHandle<()>>,
+    connection_generation: u64,
+    request: Option<JoinHandle<()>>,
+    request_generation: u64,
+    queued_request: Option<String>,
+    streaming_message: Option<usize>,
+    session_tokens: u64,
+    conversation_scroll: u16,
+    conversation_max_scroll: u16,
+    follow_output: bool,
+    should_quit: bool,
+}
+
+impl App {
+    pub fn new(
+        cwd: PathBuf,
+        default_provider: Option<ProviderKind>,
+        startup_warning: Option<String>,
+    ) -> Self {
+        let mut app = Self::new_shell(cwd);
+        if let Some(warning) = startup_warning {
+            app.push(Role::System, warning);
+        }
+        if let Some(provider) = default_provider {
+            app.begin_connect(provider);
+        } else {
+            app.push(Role::System, "Choose a default provider to get started.");
+            app.open_provider_picker();
+        }
+        app
+    }
+
+    fn new_shell(cwd: PathBuf) -> Self {
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (connection_tx, connection_rx) = mpsc::unbounded_channel();
+        Self {
+            input: Self::new_input(),
+            messages: Vec::new(),
+            cwd,
+            provider: None,
+            active_provider: None,
+            provider_name: "no provider".to_owned(),
+            models: Vec::new(),
+            model_id: "none".to_owned(),
+            model_name: "none".to_owned(),
+            reasoning_effort: "none".to_owned(),
+            reasoning_options: Vec::new(),
+            model_picker: None,
+            reasoning_picker: None,
+            provider_picker: None,
+            events_tx,
+            events_rx,
+            connection_tx,
+            connection_rx,
+            connection: None,
+            connection_generation: 0,
+            request: None,
+            request_generation: 0,
+            queued_request: None,
+            streaming_message: None,
+            session_tokens: 0,
+            conversation_scroll: 0,
+            conversation_max_scroll: 0,
+            follow_output: true,
+            should_quit: false,
+        }
+    }
+
+    pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        let mut terminal_events = EventStream::new();
+        while !self.should_quit {
+            terminal.draw(|frame| self.render(frame))?;
+            tokio::select! {
+                terminal_event = terminal_events.next() => match terminal_event {
+                    Some(Ok(event)) => self.handle_terminal_event(event),
+                    Some(Err(error)) => return Err(error),
+                    None => self.should_quit = true,
+                },
+                provider_event = self.events_rx.recv() => {
+                    if let Some((request_id, event)) = provider_event {
+                        self.handle_provider_event(request_id, event);
+                    }
+                },
+                connection_event = self.connection_rx.recv() => {
+                    if let Some(event) = connection_event { self.handle_connection_event(event); }
+                }
+            }
+        }
+        if let Some(request) = self.request.take() {
+            if let Some(provider) = self.provider.clone() {
+                let _ = provider.interrupt().await;
+            }
+            request.abort();
+        }
+        if let Some(connection) = self.connection.take() {
+            connection.abort();
+        }
+        Ok(())
+    }
+
+    fn new_input() -> TextArea<'static> {
+        let mut input = TextArea::default();
+        input.set_block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(ACCENT))
+                .style(Style::new().bg(SURFACE))
+                .title(Line::from(" prompt ").style(Style::new().fg(ACCENT).bold()))
+                .padding(Padding::horizontal(1)),
+        );
+        input.set_style(Style::new().fg(FOREGROUND).bg(SURFACE));
+        input.set_cursor_line_style(Style::new().bg(SURFACE));
+        input.set_cursor_style(Style::new().bg(ACCENT).fg(BACKGROUND));
+        input.set_placeholder_text("Ask anything…");
+        input.set_placeholder_style(Style::new().fg(MUTED));
+        input
+    }
+
+    fn render(&mut self, frame: &mut Frame) {
+        frame.render_widget(
+            Block::new().style(Style::new().bg(BACKGROUND)),
+            frame.area(),
+        );
+        let [header, conversation, prompt, footer] = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(5),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+        let [brand, status] =
+            Layout::horizontal([Constraint::Length(42), Constraint::Min(1)]).areas(header);
+        frame.render_widget(
+            Block::new()
+                .borders(Borders::BOTTOM)
+                .border_style(BORDER)
+                .style(Style::new().bg(BACKGROUND)),
+            header,
+        );
+        let [controls, usage] =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(20)]).areas(footer);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("  ◆ ", Style::new().fg(ACCENT).bold()),
+                Span::styled("whoa", Style::new().fg(FOREGROUND).bold()),
+                Span::styled(" — security-first agent harness", Style::new().fg(MUTED)),
+            ]))
+            .style(Style::new().bg(BACKGROUND)),
+            brand,
+        );
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} · {} · reasoning {} · tools sandboxed  ",
+                self.provider_name, self.model_name, self.reasoning_effort
+            ))
+            .alignment(Alignment::Right)
+            .style(Style::new().fg(MUTED).bg(BACKGROUND)),
+            status,
+        );
+
+        let mut lines = Vec::new();
+        let divider = "─".repeat(usize::from(conversation.width.saturating_sub(6)));
+        for message in &self.messages {
+            match message.role {
+                Role::You => {
+                    for (index, line) in message.content.lines().enumerate() {
+                        let marker = if index == 0 { "› " } else { "  " };
+                        lines.push(Line::from(vec![
+                            Span::styled(marker, Style::new().fg(ACCENT).bold()),
+                            Span::styled(line, Style::new().fg(FOREGROUND).bold()),
+                        ]));
+                    }
+                    lines.push(Line::default());
+                }
+                Role::Assistant => {
+                    let options = MarkdownOptions::new(WhoaMarkdown)
+                        .table_width(conversation.width.saturating_sub(4));
+                    let rendered = from_str_with_options(&message.content, &options);
+                    lines.extend(rendered.lines);
+                    lines.push(Line::default());
+                    lines.push(Line::from(Span::styled(
+                        divider.clone(),
+                        Style::new().fg(BORDER),
+                    )));
+                    lines.push(Line::default());
+                }
+                Role::System => {
+                    for (index, line) in message.content.lines().enumerate() {
+                        let marker = if index == 0 { "· " } else { "  " };
+                        let content_style = if line.starts_with('+') && !line.starts_with("+++") {
+                            Style::new().fg(ADDED)
+                        } else if line.starts_with('-') && !line.starts_with("---") {
+                            Style::new().fg(REMOVED)
+                        } else if line.starts_with("@@") {
+                            Style::new().fg(ACCENT)
+                        } else {
+                            Style::new().fg(MUTED)
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(marker, Style::new().fg(ACCENT)),
+                            Span::styled(line, content_style),
+                        ]));
+                    }
+                    lines.push(Line::default());
+                }
+            }
+        }
+        let visible_height = conversation.height;
+        let content_width = usize::from(conversation.width.saturating_sub(4).max(1));
+        let rendered_lines = lines
+            .iter()
+            .map(|line| line.width().max(1).div_ceil(content_width))
+            .sum::<usize>();
+        self.conversation_max_scroll = u16::try_from(rendered_lines)
+            .unwrap_or(u16::MAX)
+            .saturating_sub(visible_height);
+        if self.follow_output {
+            self.conversation_scroll = self.conversation_max_scroll;
+        } else {
+            self.conversation_scroll = self.conversation_scroll.min(self.conversation_max_scroll);
+        }
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(Style::new().fg(FOREGROUND).bg(BACKGROUND))
+                .block(
+                    Block::new()
+                        .style(Style::new().bg(BACKGROUND))
+                        .padding(Padding::horizontal(2)),
+                )
+                .wrap(Wrap { trim: false })
+                .scroll((self.conversation_scroll, 0)),
+            conversation,
+        );
+        frame.render_widget(&self.input, prompt);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " Enter",
+                    Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" send   ", Style::new().fg(MUTED)),
+                Span::styled("Shift+Enter", Style::new().fg(ACCENT)),
+                Span::styled(" newline   ", Style::new().fg(MUTED)),
+                Span::styled("/q", Style::new().fg(ACCENT)),
+                Span::styled(" quit", Style::new().fg(MUTED)),
+            ]))
+            .style(Style::new().bg(BACKGROUND)),
+            controls,
+        );
+        frame.render_widget(
+            Paragraph::new(format!("{} tokens  ", self.session_tokens))
+                .alignment(Alignment::Right)
+                .style(Style::new().fg(MUTED).bg(BACKGROUND)),
+            usage,
+        );
+        if let Some(picker) = &self.model_picker {
+            self.render_model_picker(frame, picker);
+        }
+        if let Some(picker) = &self.reasoning_picker {
+            self.render_reasoning_picker(frame, picker);
+        }
+        if let Some(picker) = &self.provider_picker {
+            self.render_provider_picker(frame, picker);
+        }
+    }
+
+    fn render_model_picker(&self, frame: &mut Frame, picker: &ModelPicker) {
+        let area = frame.area();
+        let width = area.width.saturating_sub(4).min(68);
+        let height = area.height.saturating_sub(4).min(
+            u16::try_from(picker.models.len())
+                .unwrap_or(u16::MAX)
+                .saturating_add(2),
+        );
+        let popup = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, popup);
+
+        let visible = usize::from(height.saturating_sub(2));
+        let start = picker
+            .selected
+            .saturating_sub(visible.saturating_sub(1))
+            .min(picker.models.len().saturating_sub(visible));
+        let lines = picker
+            .models
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .map(|(index, model)| {
+                let current = if model.id == self.model_id {
+                    "●"
+                } else {
+                    " "
+                };
+                let marker = if index == picker.selected { "›" } else { " " };
+                let style = if index == picker.selected {
+                    Style::new().fg(BACKGROUND).bg(ACCENT).bold()
+                } else {
+                    Style::new().fg(FOREGROUND).bg(SURFACE)
+                };
+                Line::styled(
+                    format!(" {marker} {current} {}  {}", model.display_name, model.id),
+                    style,
+                )
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::new().bg(SURFACE)).block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .border_style(Style::new().fg(ACCENT))
+                    .title(" model · ↑/↓ select · Enter apply · Esc close "),
+            ),
+            popup,
+        );
+    }
+
+    fn render_reasoning_picker(&self, frame: &mut Frame, picker: &ReasoningPicker) {
+        let area = frame.area();
+        let width = area.width.saturating_sub(4).min(72);
+        let height = area.height.saturating_sub(4).min(
+            u16::try_from(picker.options.len())
+                .unwrap_or(u16::MAX)
+                .saturating_mul(2)
+                .saturating_add(2),
+        );
+        let popup = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, popup);
+
+        let lines = picker
+            .options
+            .iter()
+            .enumerate()
+            .flat_map(|(index, option)| {
+                let current = if option.id == self.reasoning_effort {
+                    "●"
+                } else {
+                    " "
+                };
+                let marker = if index == picker.selected { "›" } else { " " };
+                let style = if index == picker.selected {
+                    Style::new().fg(BACKGROUND).bg(ACCENT).bold()
+                } else {
+                    Style::new().fg(FOREGROUND).bg(SURFACE)
+                };
+                [
+                    Line::styled(format!(" {marker} {current} {}", option.id), style),
+                    Line::styled(
+                        format!("       {}", option.description),
+                        Style::new().fg(MUTED).bg(SURFACE),
+                    ),
+                ]
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::new().bg(SURFACE)).block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .border_style(Style::new().fg(ACCENT))
+                    .title(" reasoning · ↑/↓ select · Enter apply · Esc close "),
+            ),
+            popup,
+        );
+    }
+
+    fn render_provider_picker(&self, frame: &mut Frame, picker: &ProviderPicker) {
+        let area = frame.area();
+        let width = area.width.saturating_sub(4).min(68);
+        let height = area.height.saturating_sub(4).min(
+            u16::try_from(picker.providers.len())
+                .unwrap_or(u16::MAX)
+                .saturating_mul(2)
+                .saturating_add(2),
+        );
+        let popup = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, popup);
+
+        let lines = picker
+            .providers
+            .iter()
+            .enumerate()
+            .flat_map(|(index, provider)| {
+                let current = if self.active_provider == Some(*provider) {
+                    "●"
+                } else {
+                    " "
+                };
+                let marker = if index == picker.selected { "›" } else { " " };
+                let style = if index == picker.selected {
+                    Style::new().fg(BACKGROUND).bg(ACCENT).bold()
+                } else {
+                    Style::new().fg(FOREGROUND).bg(SURFACE)
+                };
+                [
+                    Line::styled(
+                        format!(" {marker} {current} {}", provider.display_name()),
+                        style,
+                    ),
+                    Line::styled(
+                        format!("       {}", provider.description()),
+                        Style::new().fg(MUTED).bg(SURFACE),
+                    ),
+                ]
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::new().bg(SURFACE)).block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .border_style(Style::new().fg(ACCENT))
+                    .title(" provider · ↑/↓ select · Enter connect · Esc close "),
+            ),
+            popup,
+        );
+    }
+
+    fn handle_terminal_event(&mut self, event: Event) {
+        if self.provider_picker.is_some() {
+            if let Event::Key(key) = event
+                && key.kind == KeyEventKind::Press
+            {
+                self.handle_provider_picker_key(key);
+            }
+            return;
+        }
+        if self.model_picker.is_some() {
+            if let Event::Key(key) = event
+                && key.kind == KeyEventKind::Press
+            {
+                self.handle_model_picker_key(key);
+            }
+            return;
+        }
+        if self.reasoning_picker.is_some() {
+            if let Event::Key(key) = event
+                && key.kind == KeyEventKind::Press
+            {
+                self.handle_reasoning_picker_key(key);
+            }
+            return;
+        }
+        if let Event::Mouse(mouse) = event {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.scroll_conversation_up(3),
+                MouseEventKind::ScrollDown => self.scroll_conversation_down(3),
+                _ => {}
+            }
+            return;
+        }
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
+            && self.handle_key(key)
+        {
+            return;
+        }
+        self.input.input(event);
+    }
+
+    fn handle_provider_picker_key(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                self.provider_picker = None;
+            }
+            (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+                if let Some(picker) = &mut self.provider_picker {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+            }
+            (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+                if let Some(picker) = &mut self.provider_picker {
+                    picker.selected =
+                        (picker.selected + 1).min(picker.providers.len().saturating_sub(1));
+                }
+            }
+            (KeyCode::Enter, _) => {
+                let provider = self
+                    .provider_picker
+                    .as_ref()
+                    .and_then(|picker| picker.providers.get(picker.selected))
+                    .copied();
+                if let Some(provider) = provider {
+                    match save_default_provider(provider) {
+                        Ok(()) => {
+                            self.provider_picker = None;
+                            self.begin_connect(provider);
+                        }
+                        Err(error) => self.push(
+                            Role::System,
+                            format!("Could not save the default provider: {error:#}"),
+                        ),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_model_picker_key(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                self.model_picker = None;
+            }
+            (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+                if let Some(picker) = &mut self.model_picker {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+            }
+            (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+                if let Some(picker) = &mut self.model_picker {
+                    picker.selected = (picker.selected + 1).min(picker.models.len() - 1);
+                }
+            }
+            (KeyCode::Enter, _) => {
+                let model = self
+                    .model_picker
+                    .as_ref()
+                    .and_then(|picker| picker.models.get(picker.selected))
+                    .cloned();
+                self.model_picker = None;
+                if let Some(model) = model {
+                    let result = self.provider.as_ref().map_or_else(
+                        || Ok(model.clone()),
+                        |provider| provider.select_model(&model.id),
+                    );
+                    match result {
+                        Ok(model) => {
+                            self.model_id = model.id;
+                            self.model_name = model.display_name.clone();
+                            self.reasoning_options = model.reasoning_efforts.clone();
+                            self.reasoning_effort = model.default_reasoning_effort.clone();
+                            self.restore_reasoning_for_model();
+                            if let Some(provider) = self.active_provider
+                                && let Err(error) = save_model(provider, &self.model_id)
+                            {
+                                self.push(
+                                    Role::System,
+                                    format!("Could not remember the model: {error:#}"),
+                                );
+                            }
+                            self.push(
+                                Role::System,
+                                format!("Model switched to {}.", model.display_name),
+                            );
+                        }
+                        Err(error) => {
+                            self.push(Role::System, format!("Could not switch model: {error:#}"))
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_reasoning_picker_key(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                self.reasoning_picker = None;
+            }
+            (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+                if let Some(picker) = &mut self.reasoning_picker {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+            }
+            (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+                if let Some(picker) = &mut self.reasoning_picker {
+                    picker.selected =
+                        (picker.selected + 1).min(picker.options.len().saturating_sub(1));
+                }
+            }
+            (KeyCode::Enter, _) => {
+                let option = self
+                    .reasoning_picker
+                    .as_ref()
+                    .and_then(|picker| picker.options.get(picker.selected))
+                    .cloned();
+                self.reasoning_picker = None;
+                if let Some(option) = option {
+                    let result = self.provider.as_ref().map_or_else(
+                        || Ok(option.id.clone()),
+                        |provider| provider.select_reasoning_effort(&option.id),
+                    );
+                    match result {
+                        Ok(effort) => {
+                            self.reasoning_effort = effort;
+                            if let Some(provider) = self.active_provider
+                                && let Err(error) =
+                                    save_reasoning(provider, &self.model_id, &self.reasoning_effort)
+                            {
+                                self.push(
+                                    Role::System,
+                                    format!("Could not remember reasoning effort: {error:#}"),
+                                );
+                            }
+                            self.push(
+                                Role::System,
+                                format!("Reasoning set to {}.", self.reasoning_effort),
+                            );
+                        }
+                        Err(error) => self.push(
+                            Role::System,
+                            format!("Could not change reasoning effort: {error:#}"),
+                        ),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                if self.request.is_some() {
+                    self.interrupt_active();
+                } else {
+                    self.should_quit = true;
+                }
+                true
+            }
+            (KeyCode::Esc, _) if self.request.is_some() => {
+                self.queued_request = None;
+                self.interrupt_active();
+                true
+            }
+            (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
+                self.input.insert_newline();
+                true
+            }
+            (KeyCode::Enter, modifiers) if !modifiers.contains(KeyModifiers::SHIFT) => {
+                self.submit();
+                true
+            }
+            (KeyCode::PageUp, _) => {
+                self.scroll_conversation_up(10);
+                true
+            }
+            (KeyCode::PageDown, _) => {
+                self.scroll_conversation_down(10);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn scroll_conversation_up(&mut self, lines: u16) {
+        if self.conversation_scroll == 0 {
+            return;
+        }
+        self.follow_output = false;
+        self.conversation_scroll = self.conversation_scroll.saturating_sub(lines);
+    }
+
+    fn scroll_conversation_down(&mut self, lines: u16) {
+        self.conversation_scroll = self
+            .conversation_scroll
+            .saturating_add(lines)
+            .min(self.conversation_max_scroll);
+        self.follow_output = self.conversation_scroll == self.conversation_max_scroll;
+    }
+
+    fn follow_latest_output(&mut self) {
+        self.follow_output = true;
+    }
+
+    fn submit(&mut self) {
+        let content = self.input.lines().join("\n").trim().to_owned();
+        if content.is_empty() {
+            return;
+        }
+        self.follow_latest_output();
+        self.input = Self::new_input();
+        match content.as_str() {
+            "/q" | "/quit" | "/exit" => self.should_quit = true,
+            "/clear" => {
+                self.messages.clear();
+                self.streaming_message = None;
+                self.conversation_scroll = 0;
+                self.conversation_max_scroll = 0;
+            }
+            "/provider" => self.open_provider_picker(),
+            "/model" => self.open_model_picker(),
+            "/reasoning" => self.open_reasoning_picker(),
+            "/new" => self.begin_new_session(),
+            "/help" => self.push(
+                Role::System,
+                "/help       show this message\n/provider   choose or reconnect a provider\n/model      choose a provider model\n/reasoning  choose model reasoning effort\n/new        start a fresh session\n/clear      clear the screen\n/q, /quit   leave whoa",
+            ),
+            _ if self.request.is_some() => {
+                self.queued_request = Some(content);
+                self.interrupt_active();
+            }
+            _ => self.begin_request(content),
+        }
+    }
+
+    fn interrupt_active(&self) {
+        if let Some(provider) = self.provider.clone() {
+            let request_id = self.request_generation;
+            let sender = self.events_tx.clone();
+            tokio::spawn(async move {
+                let event = match provider.interrupt().await {
+                    Ok(()) => ProviderEvent::Interrupted,
+                    Err(error) => ProviderEvent::Failed(format!("{error:#}")),
+                };
+                let _ = sender.send((request_id, event));
+            });
+        }
+    }
+
+    fn open_provider_picker(&mut self) {
+        let providers = ProviderKind::ALL.to_vec();
+        let selected = self
+            .active_provider
+            .and_then(|active| providers.iter().position(|provider| *provider == active))
+            .unwrap_or(0);
+        self.model_picker = None;
+        self.reasoning_picker = None;
+        self.provider_picker = Some(ProviderPicker {
+            providers,
+            selected,
+        });
+    }
+
+    fn open_model_picker(&mut self) {
+        let models = self.models.clone();
+        if models.is_empty() {
+            self.push(Role::System, "The provider returned no selectable models.");
+            return;
+        }
+        let selected = models
+            .iter()
+            .position(|model| model.id == self.model_id)
+            .unwrap_or(0);
+        self.provider_picker = None;
+        self.reasoning_picker = None;
+        self.model_picker = Some(ModelPicker { models, selected });
+    }
+
+    fn open_reasoning_picker(&mut self) {
+        let options = self.reasoning_options.clone();
+        if options.is_empty() {
+            self.push(
+                Role::System,
+                "The selected model returned no reasoning options.",
+            );
+            return;
+        }
+        let selected = options
+            .iter()
+            .position(|option| option.id == self.reasoning_effort)
+            .unwrap_or(0);
+        self.provider_picker = None;
+        self.model_picker = None;
+        self.reasoning_picker = Some(ReasoningPicker { options, selected });
+    }
+
+    fn restore_reasoning_for_model(&mut self) {
+        let Some(provider_kind) = self.active_provider else {
+            return;
+        };
+        let saved = match load_reasoning(provider_kind, &self.model_id) {
+            Ok(saved) => saved,
+            Err(error) => {
+                self.push(
+                    Role::System,
+                    format!("Could not load the saved reasoning effort: {error:#}"),
+                );
+                return;
+            }
+        };
+        let Some(saved) = saved else {
+            return;
+        };
+        let Some(provider) = &self.provider else {
+            return;
+        };
+        match provider.select_reasoning_effort(&saved) {
+            Ok(effort) => self.reasoning_effort = effort,
+            Err(_) => self.push(
+                Role::System,
+                format!(
+                    "Saved reasoning effort `{saved}` is no longer available for {}.",
+                    self.model_name
+                ),
+            ),
+        }
+    }
+
+    fn begin_new_session(&mut self) {
+        let Some(provider) = self.provider.clone() else {
+            self.push(Role::System, "No provider is connected.");
+            return;
+        };
+        if let Some(request) = self.request.take() {
+            request.abort();
+        }
+        self.queued_request = None;
+        self.streaming_message = None;
+        self.request_generation = self.request_generation.wrapping_add(1);
+        let request_id = self.request_generation;
+        let sender = self.events_tx.clone();
+        self.request = Some(tokio::spawn(async move {
+            let event = match provider.new_session().await {
+                Ok(()) => ProviderEvent::SessionStarted,
+                Err(error) => {
+                    ProviderEvent::Failed(format!("could not start a new session: {error:#}"))
+                }
+            };
+            let _ = sender.send((request_id, event));
+        }));
+    }
+
+    fn begin_request(&mut self, content: String) {
+        self.push(Role::You, content.clone());
+        let Some(provider) = self.provider.clone() else {
+            self.push(Role::System, "No provider is connected.");
+            return;
+        };
+        self.streaming_message = None;
+        self.request_generation = self.request_generation.wrapping_add(1);
+        let request_id = self.request_generation;
+        let sender = self.events_tx.clone();
+        self.request = Some(tokio::spawn(async move {
+            if let Err(error) = provider.stream(content, request_id, sender.clone()).await {
+                let _ = sender.send((request_id, ProviderEvent::Failed(format!("{error:#}"))));
+            }
+        }));
+    }
+
+    fn begin_connect(&mut self, provider: ProviderKind) {
+        if let Some(connection) = self.connection.take() {
+            connection.abort();
+        }
+        if let Some(request) = self.request.take() {
+            request.abort();
+        }
+        self.streaming_message = None;
+        self.queued_request = None;
+        self.session_tokens = 0;
+        self.provider = None;
+        self.active_provider = Some(provider);
+        self.provider_name = provider.display_name().to_owned();
+        self.models.clear();
+        self.model_id = "none".to_owned();
+        self.model_name = "connecting…".to_owned();
+        self.reasoning_effort = "none".to_owned();
+        self.reasoning_options.clear();
+        self.connection_generation = self.connection_generation.wrapping_add(1);
+        let generation = self.connection_generation;
+        let cwd = self.cwd.clone();
+        let sender = self.connection_tx.clone();
+        let saved_model = match load_model(provider) {
+            Ok(model) => model,
+            Err(error) => {
+                self.push(
+                    Role::System,
+                    format!("Could not load the saved model: {error:#}"),
+                );
+                None
+            }
+        };
+        self.push(
+            Role::System,
+            format!(
+                "Connecting to {}… Browser sign-in opens if needed.",
+                provider.display_name()
+            ),
+        );
+        self.connection = Some(tokio::spawn(async move {
+            let event = match provider {
+                ProviderKind::Codex => match Codex::connect(&cwd).await {
+                    Ok(provider) => {
+                        let warning = saved_model.and_then(|model| {
+                            provider.select_model(&model).err().map(|_| {
+                                format!(
+                                    "Saved model `{model}` is no longer available; using the provider default."
+                                )
+                            })
+                        });
+                        ConnectionEvent::Connected(generation, provider, warning)
+                    }
+                    Err(error) => ConnectionEvent::Failed(generation, format!("{error:#}")),
+                },
+            };
+            let _ = sender.send(event);
+        }));
+    }
+
+    fn handle_connection_event(&mut self, event: ConnectionEvent) {
+        let generation = match &event {
+            ConnectionEvent::Connected(generation, _, _)
+            | ConnectionEvent::Failed(generation, _) => *generation,
+        };
+        if generation != self.connection_generation {
+            return;
+        }
+        self.connection = None;
+        match event {
+            ConnectionEvent::Connected(_, provider, warning) => {
+                let identity = provider.account().unwrap_or("ChatGPT").to_owned();
+                let model = provider.model();
+                self.models = provider.models().to_vec();
+                self.model_id = model.id;
+                self.model_name = model.display_name;
+                self.reasoning_effort = model.default_reasoning_effort;
+                self.reasoning_options = model.reasoning_efforts;
+                self.provider = Some(provider);
+                self.restore_reasoning_for_model();
+                self.push(
+                    Role::System,
+                    format!("Connected as {identity}. Type /help for commands."),
+                );
+                if let Some(warning) = warning {
+                    self.push(Role::System, warning);
+                }
+            }
+            ConnectionEvent::Failed(_, error) => {
+                self.provider = None;
+                self.model_id = "none".to_owned();
+                self.model_name = "connection failed".to_owned();
+                self.reasoning_effort = "none".to_owned();
+                self.reasoning_options.clear();
+                self.push(Role::System, format!("Provider connection failed: {error}"));
+                self.open_provider_picker();
+            }
+        }
+    }
+
+    fn handle_provider_event(&mut self, request_id: u64, event: ProviderEvent) {
+        if request_id != self.request_generation {
+            return;
+        }
+        match event {
+            ProviderEvent::Delta(delta) => {
+                if self.streaming_message.is_none() {
+                    self.push(Role::Assistant, String::new());
+                    self.streaming_message = Some(self.messages.len() - 1);
+                }
+                if let Some(index) = self.streaming_message
+                    && let Some(message) = self.messages.get_mut(index)
+                {
+                    message.content.push_str(&delta);
+                }
+            }
+            ProviderEvent::Usage(tokens) => self.session_tokens = tokens,
+            ProviderEvent::ToolStarted(tool) => {
+                self.streaming_message = None;
+                self.push(Role::System, format!("Running {tool} in nono…"));
+            }
+            ProviderEvent::ToolFinished {
+                tool,
+                success,
+                output,
+            } => {
+                self.streaming_message = None;
+                if success {
+                    if matches!(tool.as_str(), "write_file" | "edit_file" | "delete_file")
+                        && !output.trim().is_empty()
+                    {
+                        self.push(
+                            Role::System,
+                            format!("Completed {tool}\n{}", output.trim_end()),
+                        );
+                    } else {
+                        self.push(Role::System, format!("Completed {tool}"));
+                    }
+                } else {
+                    self.push(
+                        Role::System,
+                        format!("Failed {tool}\n{}", output.trim_end()),
+                    );
+                }
+            }
+            ProviderEvent::Completed => {
+                self.streaming_message = None;
+                self.request = None;
+                self.start_queued_request();
+            }
+            ProviderEvent::Interrupted => {
+                self.streaming_message = None;
+                if let Some(request) = self.request.take() {
+                    request.abort();
+                }
+                self.request_generation = self.request_generation.wrapping_add(1);
+                self.push(Role::System, "Response interrupted.");
+                self.start_queued_request();
+            }
+            ProviderEvent::SessionStarted => {
+                self.messages.clear();
+                self.streaming_message = None;
+                self.session_tokens = 0;
+                self.request = None;
+                self.push(Role::System, "New session started.");
+            }
+            ProviderEvent::Failed(error) => {
+                if let Some(index) = self.streaming_message.take() {
+                    if let Some(message) = self.messages.get_mut(index) {
+                        message.content = format!("Request failed: {error}");
+                    }
+                } else {
+                    self.push(Role::System, format!("Request failed: {error}"));
+                }
+                self.request = None;
+                self.start_queued_request();
+            }
+        }
+    }
+
+    fn start_queued_request(&mut self) {
+        if let Some(content) = self.queued_request.take() {
+            self.begin_request(content);
+        }
+    }
+
+    fn push(&mut self, role: Role, content: impl Into<String>) {
+        self.messages.push(Message {
+            role,
+            content: content.into(),
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn app_with_input(value: &str) -> App {
+        let mut app = App::new_shell(PathBuf::from("."));
+        app.input.insert_str(value);
+        app
+    }
+    #[test]
+    fn submitting_text_adds_local_shell_messages() {
+        let mut app = app_with_input("hello");
+        app.submit();
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.messages[0].content, "hello");
+        assert!(app.input.is_empty());
+    }
+    #[test]
+    fn quit_command_exits() {
+        let mut app = app_with_input("/quit");
+        app.submit();
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn short_quit_command_exits() {
+        let mut app = app_with_input("/q");
+        app.submit();
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline() {
+        let mut app = app_with_input("first line");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.input.insert_str("second line");
+        assert_eq!(app.input.lines(), ["first line", "second line"]);
+    }
+
+    #[test]
+    fn usage_event_updates_session_tokens() {
+        let mut app = app_with_input("");
+        app.handle_provider_event(0, ProviderEvent::Usage(12_345));
+        assert_eq!(app.session_tokens, 12_345);
+    }
+
+    #[test]
+    fn stale_provider_events_are_ignored() {
+        let mut app = app_with_input("");
+        app.request_generation = 2;
+        app.handle_provider_event(1, ProviderEvent::Usage(12_345));
+        assert_eq!(app.session_tokens, 0);
+    }
+
+    #[test]
+    fn interrupted_response_adds_status_message() {
+        let mut app = app_with_input("");
+        app.handle_provider_event(0, ProviderEvent::Interrupted);
+        assert_eq!(
+            app.messages.last().unwrap().content,
+            "Response interrupted."
+        );
+    }
+
+    #[tokio::test]
+    async fn input_remains_editable_while_streaming() {
+        let mut app = app_with_input("");
+        app.request = Some(tokio::spawn(std::future::pending()));
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.input.lines(), ["x"]);
+        app.request.take().unwrap().abort();
+    }
+
+    #[test]
+    fn conversation_scroll_stops_and_resumes_following_output() {
+        let mut app = App::new_shell(PathBuf::from("."));
+        app.conversation_scroll = 20;
+        app.conversation_max_scroll = 20;
+
+        app.scroll_conversation_up(3);
+        assert_eq!(app.conversation_scroll, 17);
+        assert!(!app.follow_output);
+
+        app.scroll_conversation_down(3);
+        assert_eq!(app.conversation_scroll, 20);
+        assert!(app.follow_output);
+    }
+
+    #[test]
+    fn scrolling_short_history_keeps_following_output() {
+        let mut app = App::new_shell(PathBuf::from("."));
+        app.scroll_conversation_up(3);
+        assert!(app.follow_output);
+    }
+
+    #[test]
+    fn clear_command_removes_messages_from_screen() {
+        let mut app = app_with_input("hello");
+        app.submit();
+        app.input.insert_str("/clear");
+        app.submit();
+        assert!(app.messages.is_empty());
+    }
+
+    #[test]
+    fn markdown_code_blocks_hide_literal_fences() {
+        let options = MarkdownOptions::new(WhoaMarkdown);
+        let rendered = from_str_with_options("```text\npermission denied\n```", &options);
+        let visible = rendered.to_string();
+        assert!(visible.contains("permission denied"));
+        assert!(!visible.contains("```"));
+    }
+
+    #[test]
+    fn provider_command_opens_picker() {
+        let mut app = app_with_input("/provider");
+        app.submit();
+        assert!(app.provider_picker.is_some());
+    }
+
+    #[test]
+    fn model_command_opens_picker_and_applies_selection() {
+        let mut app = app_with_input("/model");
+        app.models = vec![
+            Model {
+                id: "model-a".to_owned(),
+                display_name: "Model A".to_owned(),
+                default_reasoning_effort: "medium".to_owned(),
+                reasoning_efforts: vec![ReasoningOption {
+                    id: "medium".to_owned(),
+                    description: "Balanced".to_owned(),
+                }],
+            },
+            Model {
+                id: "model-b".to_owned(),
+                display_name: "Model B".to_owned(),
+                default_reasoning_effort: "low".to_owned(),
+                reasoning_efforts: vec![ReasoningOption {
+                    id: "low".to_owned(),
+                    description: "Fast".to_owned(),
+                }],
+            },
+        ];
+        app.model_id = "model-a".to_owned();
+        app.model_name = "Model A".to_owned();
+
+        app.submit();
+        assert!(app.model_picker.is_some());
+        app.handle_model_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_model_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.model_picker.is_none());
+        assert_eq!(app.model_id, "model-b");
+        assert_eq!(app.model_name, "Model B");
+        assert_eq!(app.reasoning_effort, "low");
+    }
+
+    #[test]
+    fn reasoning_command_opens_picker() {
+        let mut app = app_with_input("/reasoning");
+        app.reasoning_effort = "medium".to_owned();
+        app.reasoning_options = vec![ReasoningOption {
+            id: "medium".to_owned(),
+            description: "Balanced".to_owned(),
+        }];
+
+        app.submit();
+
+        assert!(app.reasoning_picker.is_some());
+    }
+
+    #[test]
+    fn new_requires_a_connected_provider() {
+        let mut app = app_with_input("/new");
+
+        app.submit();
+
+        assert_eq!(
+            app.messages.last().unwrap().content,
+            "No provider is connected."
+        );
+    }
+}
