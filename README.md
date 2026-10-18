@@ -16,8 +16,14 @@
 ## Usage
 
 Nono 0.80 is embedded directly, so no separate `nono` installation is needed.
-Prebuilt binaries are published on the
-[GitHub Releases](https://github.com/SequeI/nonaut/releases) page.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nolabs-ai/nonaut/main/install.sh | sh
+```
+
+The installer selects the correct Linux or macOS binary, verifies its SHA-256
+checksum, and installs it to `~/.local/bin`. Run it again at any time to install
+the latest release. Set `NONAUT_INSTALL_DIR` to choose another directory.
 
 ```sh
 nonaut
@@ -105,7 +111,7 @@ session metadata.
 Building from source requires Rust 1.99.1.
 
 ```sh
-git clone git@github.com:SequeI/nonaut.git
+git clone git@github.com:nolabs-ai/nonaut.git
 cd nonaut
 make run
 ```
@@ -117,6 +123,7 @@ Development commands:
 | `make run` | Build an optimized binary and launch Nonaut |
 | `make build` | Build the optimized binary |
 | `make check` | Check formatting, run Clippy, and run unit tests |
+| `make script-check` | Validate the installer script syntax |
 | `make integration` | Run provider-free tests against the real sandbox and TUI |
 | `make smoke` | Smoke-test the release binary through `nonaut exec` |
 | `make fmt` | Format the Rust workspace |
@@ -133,6 +140,17 @@ make smoke
 ```
 
 The integration suite does not connect to a provider or consume model tokens.
+
+### Install from main
+
+Developers can build and install the latest `main` branch directly. This
+requires Cargo and Rust 1.99.1.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nolabs-ai/nonaut/main/install.sh | sh -s -- --from-main
+```
+
+Running the command again downloads and rebuilds the latest source.
 
 ## Limitations
 

@@ -1,8 +1,8 @@
 .DEFAULT_GOAL := check
 
-.PHONY: check fmt fmt-check lint test integration build smoke run clean
+.PHONY: check fmt fmt-check lint script-check test integration build smoke run clean
 
-check: fmt-check lint test
+check: fmt-check lint script-check test
 
 fmt:
 	cargo fmt --all
@@ -12,6 +12,9 @@ fmt-check:
 
 lint:
 	cargo clippy --all-targets --all-features -- -D warnings
+
+script-check:
+	sh -n install.sh
 
 test:
 	cargo test --all-targets --all-features
