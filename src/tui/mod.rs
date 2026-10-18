@@ -7,7 +7,7 @@ use futures_util::StreamExt;
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
 };
@@ -24,14 +24,14 @@ use crate::{
     providers::{Model, Provider, ProviderEvent, ProviderKind, ReasoningOption},
 };
 
-const BACKGROUND: Color = Color::Rgb(17, 17, 16);
-const SURFACE: Color = Color::Rgb(25, 25, 24);
-const FOREGROUND: Color = Color::Rgb(232, 232, 232);
-const MUTED: Color = Color::Rgb(136, 136, 136);
-const BORDER: Color = Color::Rgb(50, 50, 49);
+const BACKGROUND: Color = Color::Rgb(0, 0, 0);
+const SURFACE: Color = Color::Rgb(14, 14, 14);
+const FOREGROUND: Color = Color::Rgb(237, 237, 237);
+const MUTED: Color = Color::Rgb(122, 122, 122);
+const BORDER: Color = Color::Rgb(31, 31, 31);
 const ACCENT: Color = Color::Rgb(232, 115, 74);
-const ADDED: Color = Color::Rgb(126, 198, 153);
-const REMOVED: Color = Color::Rgb(224, 108, 117);
+const ADDED: Color = Color::Rgb(107, 217, 154);
+const REMOVED: Color = Color::Rgb(255, 107, 107);
 // Driven by the event loop, not the terminal, so a frozen app stops blinking.
 const CURSOR_BLINK: Duration = Duration::from_millis(530);
 const BRAND_MARK: &str = "⎔";
@@ -342,14 +342,15 @@ impl App {
         let mut input = TextArea::default();
         input.set_block(
             Block::new()
-                .borders(Borders::ALL)
-                .border_style(Style::new().fg(ACCENT))
-                .style(Style::new().bg(SURFACE))
-                .title(Line::from(" prompt ").style(Style::new().fg(ACCENT).bold()))
-                .padding(Padding::horizontal(1)),
+                .borders(Borders::TOP)
+                .border_style(Style::new().fg(BORDER))
+                .style(Style::new().bg(BACKGROUND))
+                .title(Line::from("  › ").style(Style::new().fg(ACCENT).bold()))
+                // Align typed text with message text: 2 conversation padding + "›  ".
+                .padding(Padding::new(5, 1, 0, 0)),
         );
-        input.set_style(Style::new().fg(FOREGROUND).bg(SURFACE));
-        input.set_cursor_line_style(Style::new().bg(SURFACE));
+        input.set_style(Style::new().fg(FOREGROUND).bg(BACKGROUND));
+        input.set_cursor_line_style(Style::new().bg(BACKGROUND));
         input.set_cursor_style(Style::new().bg(ACCENT).fg(BACKGROUND));
         input.set_placeholder_text("Ask anything…");
         input.set_placeholder_style(Style::new().fg(MUTED));
@@ -386,17 +387,16 @@ impl App {
         let [controls, usage] =
             Layout::horizontal([Constraint::Min(1), Constraint::Length(20)]).areas(footer);
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(format!("  {BRAND_MARK}  "), Style::new().fg(ACCENT).bold()),
-                Span::styled("nonaut", Style::new().fg(FOREGROUND).bold()),
-                Span::styled(" · security-first agent harness", Style::new().fg(MUTED)),
-            ]))
+            Paragraph::new(Line::from(vec![Span::styled(
+                format!("  {BRAND_MARK}  nonaut"),
+                Style::new().fg(ACCENT).bold(),
+            )]))
             .style(Style::new().bg(BACKGROUND)),
             brand,
         );
         frame.render_widget(
             Paragraph::new(format!(
-                "{} · {} · reasoning {} · tools sandboxed  ",
+                "{}   {}   reasoning {}   sandboxed  ",
                 self.provider_name, self.model_name, self.reasoning_effort
             ))
             .alignment(Alignment::Right)
@@ -405,12 +405,11 @@ impl App {
         );
 
         let mut lines = Vec::new();
-        let divider = "─".repeat(usize::from(conversation.width.saturating_sub(6)));
         for message in &self.messages {
             match message.role {
                 Role::You => {
                     for (index, line) in message.content.lines().enumerate() {
-                        let marker = if index == 0 { "› " } else { "  " };
+                        let marker = if index == 0 { "›  " } else { "   " };
                         lines.push(Line::from(vec![
                             Span::styled(marker, Style::new().fg(ACCENT).bold()),
                             Span::styled(line, Style::new().fg(FOREGROUND).bold()),
@@ -424,63 +423,46 @@ impl App {
                     let rendered = from_str_with_options(&message.content, &options);
                     lines.extend(rendered.lines);
                     lines.push(Line::default());
-                    lines.push(Line::from(Span::styled(
-                        divider.clone(),
-                        Style::new().fg(BORDER),
-                    )));
                     lines.push(Line::default());
                 }
                 Role::System => {
-                    for (index, line) in message.content.lines().enumerate() {
-                        let marker = if index == 0 { "· " } else { "  " };
+                    for line in message.content.lines() {
+                        let marker = "   ";
                         let content_style = if line.starts_with('+') && !line.starts_with("+++") {
                             Style::new().fg(ADDED)
                         } else if line.starts_with('-') && !line.starts_with("---") {
                             Style::new().fg(REMOVED)
-                        } else if line.starts_with("@@") {
-                            Style::new().fg(ACCENT)
                         } else {
                             Style::new().fg(MUTED)
                         };
                         lines.push(Line::from(vec![
-                            Span::styled(marker, Style::new().fg(ACCENT)),
+                            Span::styled(marker, Style::new().fg(MUTED)),
                             Span::styled(line, content_style),
                         ]));
                     }
                     lines.push(Line::default());
                 }
                 Role::Running => {
-                    for (index, line) in message.content.lines().enumerate() {
+                    for line in message.content.lines() {
                         lines.push(Line::from(vec![
-                            Span::styled(
-                                if index == 0 {
-                                    "· ".to_owned()
-                                } else {
-                                    "  ".to_owned()
-                                },
-                                Style::new().fg(ACCENT).bold(),
-                            ),
+                            Span::styled("   ".to_owned(), Style::new().fg(MUTED)),
                             Span::styled(line, Style::new().fg(MUTED)),
                         ]));
                     }
                     lines.push(Line::default());
                 }
                 Role::Success => {
-                    for (index, line) in message.content.lines().enumerate() {
-                        let marker = if index == 0 { "◆ " } else { "  " };
+                    for line in message.content.lines() {
+                        let marker = "   ";
                         let content_style = if line.starts_with('+') && !line.starts_with("+++") {
                             Style::new().fg(ADDED)
                         } else if line.starts_with('-') && !line.starts_with("---") {
                             Style::new().fg(REMOVED)
-                        } else if line.starts_with("@@") {
-                            Style::new().fg(ACCENT)
-                        } else if index == 0 {
-                            Style::new().fg(ADDED)
                         } else {
                             Style::new().fg(MUTED)
                         };
                         lines.push(Line::from(vec![
-                            Span::styled(marker, Style::new().fg(ADDED).bold()),
+                            Span::styled(marker, Style::new().fg(MUTED)),
                             Span::styled(line, content_style),
                         ]));
                     }
@@ -488,14 +470,14 @@ impl App {
                 }
                 Role::Error => {
                     for (index, line) in message.content.lines().enumerate() {
-                        let marker = if index == 0 { "◆ " } else { "  " };
+                        let marker = "   ";
                         let content_style = if index == 0 {
                             Style::new().fg(REMOVED)
                         } else {
                             Style::new().fg(MUTED)
                         };
                         lines.push(Line::from(vec![
-                            Span::styled(marker, Style::new().fg(REMOVED).bold()),
+                            Span::styled(marker, Style::new().fg(MUTED)),
                             Span::styled(line, content_style),
                         ]));
                     }
@@ -532,19 +514,16 @@ impl App {
         self.input.set_cursor_style(if self.cursor_visible {
             Style::new().bg(ACCENT).fg(BACKGROUND)
         } else {
-            Style::new().fg(FOREGROUND).bg(SURFACE)
+            Style::new().fg(FOREGROUND).bg(BACKGROUND)
         });
         frame.render_widget(&self.input, prompt);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(
-                    " Enter",
-                    Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
+                Span::styled("   Enter", Style::new().fg(FOREGROUND)),
                 Span::styled(" send   ", Style::new().fg(MUTED)),
-                Span::styled("Shift+Enter", Style::new().fg(ACCENT)),
+                Span::styled("Shift+Enter", Style::new().fg(FOREGROUND)),
                 Span::styled(" newline   ", Style::new().fg(MUTED)),
-                Span::styled("/q", Style::new().fg(ACCENT)),
+                Span::styled("/q", Style::new().fg(FOREGROUND)),
                 Span::styled(" quit", Style::new().fg(MUTED)),
             ]))
             .style(Style::new().bg(BACKGROUND)),
