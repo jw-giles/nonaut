@@ -28,25 +28,30 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     sessions::run_cli(args).await
 }
 
+pub async fn run_exec(command: String) -> Result<String> {
+    let workspace = std::env::current_dir().context("could not determine the working directory")?;
+    tools::execute_shell(&workspace, command).await
+}
+
 pub async fn run_session_worker(id: String, workspace: std::path::PathBuf) -> Result<()> {
     sessions::run_worker(id, workspace).await
 }
 
 pub async fn run_tui() -> Result<()> {
     let cwd = std::env::current_dir().context("could not determine the working directory")?;
-    let (default_provider, startup_warning) =
-        if std::env::var_os("NONAUT_NO_AUTO_CONNECT").is_some() {
-            (None, None)
-        } else {
-            match config::load_default_provider() {
-                Ok(provider) => (provider, None),
-                Err(error) => (
-                    None,
-                    Some(format!("Could not load the saved provider: {error:#}")),
-                ),
-            }
+    let no_auto_connect = std::env::var_os("NONAUT_NO_AUTO_CONNECT").is_some();
+    let mut app = if no_auto_connect {
+        App::new_shell(cwd)
+    } else {
+        let (default_provider, startup_warning) = match config::load_default_provider() {
+            Ok(provider) => (provider, None),
+            Err(error) => (
+                None,
+                Some(format!("Could not load the saved provider: {error:#}")),
+            ),
         };
-    let mut app = App::new(cwd, default_provider, startup_warning);
+        App::new(cwd, default_provider, startup_warning)
+    };
     let mut terminal = ratatui::init();
     let keyboard_enhancements = execute!(
         std::io::stdout(),

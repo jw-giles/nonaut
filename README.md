@@ -55,12 +55,31 @@ provider, model, and reasoning effort.
 | `/model` | Select a model |
 | `/reasoning` | Select reasoning effort |
 | `/new` | Start a fresh session |
+| `/exec <command>` | Run a command directly inside nono |
 | `/clear` | Clear the screen |
 | `/detach` | Keep the session running and return to the shell |
 | `/q` | Quit |
 
 `Shift+Enter` inserts a newline. `Esc` interrupts an active response. Sending a
 new prompt while streaming interrupts the current response first.
+
+`/exec` does not require a connected provider. It runs through the same fresh,
+workspace-only nono sandbox used for agent tool calls, which makes policy and
+denial testing immediate:
+
+```text
+/exec ls .
+/exec ls ~/.ssh
+/exec printf 'hello\n' > test.txt
+```
+
+The same path is available without opening the TUI, which is useful for scripts
+and policy checks:
+
+```sh
+nonaut exec -- "ls ."
+nonaut exec -- "ls ~/.ssh"
+```
 
 Detached sessions keep their active provider and conversation in a local
 worker. They are created only when `/detach` is used and expire after 24 hours
@@ -82,10 +101,12 @@ session metadata.
 
 ```sh
 make check
+make integration
 ```
 
-`make fmt`, `make lint`, `make test`, `make build`, `make smoke`, and `make run`
-are also available.
+`make integration` runs provider-free black-box tests against the real nono
+sandbox and terminal interface. `make fmt`, `make lint`, `make test`,
+`make build`, `make smoke`, and `make run` are also available.
 
 ## Limitations
 

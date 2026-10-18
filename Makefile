@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := check
 
-.PHONY: check fmt fmt-check lint test build smoke run clean
+.PHONY: check fmt fmt-check lint test integration build smoke run clean
 
 check: fmt-check lint test
 
@@ -16,11 +16,14 @@ lint:
 test:
 	cargo test --all-targets --all-features
 
+integration: build
+	cargo test --test harness -- --ignored --test-threads=1
+
 build:
 	cargo build --release
 
 smoke: build
-	printf '%s\n' '{"path":"Cargo.toml","start_line":1,"end_line":3}' | ./target/release/nonaut __nonaut_sandbox tool "$(CURDIR)" read_file | grep -q 'name = "nonaut"'
+	./target/release/nonaut exec -- "printf nonaut-smoke" | grep -q 'nonaut-smoke'
 
 run:
 	cargo run --release

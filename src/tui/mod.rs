@@ -37,7 +37,7 @@ struct SlashCommand {
     visible: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 10] = [
+const SLASH_COMMANDS: [SlashCommand; 11] = [
     SlashCommand {
         name: "/provider",
         description: "choose or reconnect a provider",
@@ -56,6 +56,11 @@ const SLASH_COMMANDS: [SlashCommand; 10] = [
     SlashCommand {
         name: "/new",
         description: "start a fresh session",
+        visible: true,
+    },
+    SlashCommand {
+        name: "/exec",
+        description: "run a command directly in nono",
         visible: true,
     },
     SlashCommand {
@@ -208,6 +213,7 @@ pub struct App {
     connection: Option<JoinHandle<()>>,
     connection_generation: u64,
     request: Option<JoinHandle<()>>,
+    request_uses_provider: bool,
     request_generation: u64,
     queued_request: Option<String>,
     streaming_message: Option<usize>,
@@ -240,7 +246,7 @@ impl App {
         app
     }
 
-    fn new_shell(cwd: PathBuf) -> Self {
+    pub(crate) fn new_shell(cwd: PathBuf) -> Self {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (connection_tx, connection_rx) = mpsc::unbounded_channel();
         Self {
@@ -265,6 +271,7 @@ impl App {
             connection: None,
             connection_generation: 0,
             request: None,
+            request_uses_provider: false,
             request_generation: 0,
             queued_request: None,
             streaming_message: None,
@@ -1081,11 +1088,20 @@ impl App {
             "/model" => self.open_model_picker(),
             "/reasoning" => self.open_reasoning_picker(),
             "/new" => self.begin_new_session(),
+            "/exec" => self.push(Role::System, "Usage: /exec <command>"),
             "/detach" => match crate::sessions::request_detach() {
                 Ok(()) => self.push(Role::System, "Session detached."),
                 Err(error) => self.push(Role::Error, format!("Could not detach: {error:#}")),
             },
             "/help" => self.push(Role::System, Self::command_help()),
+            _ if content.starts_with("/exec ") => {
+                let command = content[6..].trim().to_owned();
+                if command.is_empty() {
+                    self.push(Role::System, "Usage: /exec <command>");
+                } else {
+                    self.begin_exec(command);
+                }
+            }
             _ if self.request.is_some() => {
                 self.queued_request = Some(content);
                 self.interrupt_active();
@@ -1104,6 +1120,15 @@ impl App {
     }
 
     fn interrupt_active(&self) {
+        if !self.request_uses_provider {
+            if let Some(request) = &self.request {
+                request.abort();
+                let _ = self
+                    .events_tx
+                    .send((self.request_generation, ProviderEvent::Interrupted));
+            }
+            return;
+        }
         if let Some(provider) = self.provider.clone() {
             let request_id = self.request_generation;
             let sender = self.events_tx.clone();
@@ -1218,6 +1243,42 @@ impl App {
             };
             let _ = sender.send((request_id, event));
         }));
+        self.request_uses_provider = true;
+    }
+
+    fn begin_exec(&mut self, command: String) {
+        if self.request.is_some() {
+            self.push(
+                Role::System,
+                "A response or command is already running. Press Esc to interrupt it first.",
+            );
+            return;
+        }
+        self.push(Role::You, format!("/exec {command}"));
+        self.streaming_message = None;
+        self.tool_summaries.clear();
+        self.request_generation = self.request_generation.wrapping_add(1);
+        let request_id = self.request_generation;
+        let sender = self.events_tx.clone();
+        let workspace = self.cwd.clone();
+        self.request_uses_provider = false;
+        self.request = Some(tokio::spawn(async move {
+            let _ = sender.send((request_id, ProviderEvent::ToolStarted("exec".to_owned())));
+            let result = crate::tools::execute_shell(&workspace, command).await;
+            let (success, output) = match result {
+                Ok(output) => (true, output),
+                Err(error) => (false, format!("{error:#}")),
+            };
+            let _ = sender.send((
+                request_id,
+                ProviderEvent::ToolFinished {
+                    tool: "exec".to_owned(),
+                    success,
+                    output,
+                },
+            ));
+            let _ = sender.send((request_id, ProviderEvent::Completed));
+        }));
     }
 
     fn begin_request(&mut self, content: String) {
@@ -1236,6 +1297,7 @@ impl App {
                 let _ = sender.send((request_id, ProviderEvent::Failed(format!("{error:#}"))));
             }
         }));
+        self.request_uses_provider = true;
     }
 
     fn begin_connect(&mut self, provider: ProviderKind) {
@@ -1357,7 +1419,11 @@ impl App {
                 if Self::compact_tool(&tool) {
                     self.start_compact_tool(&tool);
                 } else {
-                    self.push(Role::Running, format!("Running {tool} in nono…"));
+                    if tool == "exec" {
+                        self.push(Role::Running, "Running command in nono…");
+                    } else {
+                        self.push(Role::Running, format!("Running {tool} in nono…"));
+                    }
                 }
             }
             ProviderEvent::ToolFinished {
@@ -1378,32 +1444,51 @@ impl App {
                     message.role = Role::System;
                 }
                 if success {
-                    if matches!(tool.as_str(), "write_file" | "edit_file" | "delete_file")
-                        && !output.trim().is_empty()
+                    if matches!(
+                        tool.as_str(),
+                        "write_file" | "edit_file" | "delete_file" | "exec"
+                    ) && !output.trim().is_empty()
                     {
-                        self.push(
-                            Role::Success,
-                            format!("Completed {tool}\n{}", output.trim_end()),
-                        );
+                        let label = if tool == "exec" {
+                            "Command completed".to_owned()
+                        } else {
+                            format!("Completed {tool}")
+                        };
+                        self.push(Role::Success, format!("{label}\n{}", output.trim_end()));
                     } else {
                         self.push(Role::Success, format!("Completed {tool}"));
                     }
                 } else {
-                    self.push(Role::Error, format!("Failed {tool}\n{}", output.trim_end()));
+                    let label = if tool == "exec" {
+                        "Command failed".to_owned()
+                    } else {
+                        format!("Failed {tool}")
+                    };
+                    self.push(Role::Error, format!("{label}\n{}", output.trim_end()));
                 }
             }
             ProviderEvent::Completed => {
                 self.streaming_message = None;
                 self.request = None;
+                self.request_uses_provider = false;
                 self.start_queued_request();
             }
             ProviderEvent::Interrupted => {
+                let provider_request = self.request_uses_provider;
                 self.streaming_message = None;
                 if let Some(request) = self.request.take() {
                     request.abort();
                 }
                 self.request_generation = self.request_generation.wrapping_add(1);
-                self.push(Role::System, "Response interrupted.");
+                self.request_uses_provider = false;
+                self.push(
+                    Role::System,
+                    if provider_request {
+                        "Response interrupted."
+                    } else {
+                        "Command interrupted."
+                    },
+                );
                 self.start_queued_request();
             }
             ProviderEvent::SessionStarted => {
@@ -1412,6 +1497,7 @@ impl App {
                 self.tool_summaries.clear();
                 self.session_tokens = 0;
                 self.request = None;
+                self.request_uses_provider = false;
                 self.push(Role::System, "New session started.");
             }
             ProviderEvent::Failed(error) => {
@@ -1423,6 +1509,7 @@ impl App {
                     self.push(Role::System, format!("Request failed: {error}"));
                 }
                 self.request = None;
+                self.request_uses_provider = false;
                 self.start_queued_request();
             }
         }
@@ -1606,6 +1693,7 @@ mod tests {
         let help = App::command_help();
         assert!(help.contains("/provider"));
         assert!(help.contains("/reasoning"));
+        assert!(help.contains("/exec"));
         assert!(help.contains("/q"));
         assert!(help.contains("/detach"));
         assert!(!help.lines().any(|line| line.starts_with("/quit")));
@@ -1701,6 +1789,7 @@ mod tests {
     #[test]
     fn interrupted_response_adds_status_message() {
         let mut app = app_with_input("");
+        app.request_uses_provider = true;
         app.handle_provider_event(0, ProviderEvent::Interrupted);
         assert_eq!(
             app.messages.last().unwrap().content,
@@ -1828,5 +1917,37 @@ mod tests {
             app.messages.last().unwrap().content,
             "No provider is connected."
         );
+    }
+
+    #[test]
+    fn exec_without_a_command_shows_usage() {
+        let mut app = app_with_input("/exec");
+        app.submit();
+        assert_eq!(
+            app.messages.last().unwrap().content,
+            "Usage: /exec <command>"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_does_not_require_a_provider() {
+        let mut app = app_with_input("/exec printf hello");
+        app.submit();
+        assert!(app.request.is_some());
+        assert!(!app.request_uses_provider);
+        assert_eq!(app.messages[0].content, "/exec printf hello");
+        app.request.take().unwrap().abort();
+    }
+
+    #[tokio::test]
+    async fn exec_can_be_interrupted_without_a_provider() {
+        let mut app = app_with_input("/exec sleep 30");
+        app.submit();
+        app.interrupt_active();
+        while app.request.is_some() {
+            let (request_id, event) = app.events_rx.recv().await.unwrap();
+            app.handle_provider_event(request_id, event);
+        }
+        assert_eq!(app.messages.last().unwrap().content, "Command interrupted.");
     }
 }

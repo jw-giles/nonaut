@@ -29,5 +29,23 @@ fn main() -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("session workspace was not provided"))?;
         return runtime.block_on(nonaut::run_session_worker(id, workspace));
     }
+    if mode == Some("exec") {
+        let command = args
+            .iter()
+            .skip(1)
+            .skip_while(|argument| argument.as_str() == "--")
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if command.trim().is_empty() {
+            anyhow::bail!("usage: nonaut exec [--] <command>");
+        }
+        let output = runtime.block_on(nonaut::run_exec(command))?;
+        print!("{output}");
+        if !output.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    }
     runtime.block_on(nonaut::run(args))
 }

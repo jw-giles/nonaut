@@ -167,6 +167,18 @@ pub async fn execute(workspace: &Path, tool: &str, arguments: &Value) -> Result<
     output_result(tool, output)
 }
 
+pub(crate) async fn execute_shell(workspace: &Path, command: String) -> Result<String> {
+    execute(
+        workspace,
+        "run_command",
+        &json!({
+            "program": "sh",
+            "args": ["-c", command],
+        }),
+    )
+    .await
+}
+
 fn normalize_tool_paths(workspace: &Path, tool: &str, arguments: &Value) -> Result<Value> {
     let mut expanded = arguments.clone();
     let home = BaseDirs::new()
