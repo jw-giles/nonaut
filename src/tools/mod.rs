@@ -481,7 +481,9 @@ fn allow_existing(
         capabilities
             .allow_path(path, access)
             .with_context(|| format!("could not grant access to {}", path.display()))
-    } else if path.exists() {
+    } else if fs::canonicalize(path).is_ok() {
+        // /dev/stdin etc. resolve to pipe:[N] when stdio is piped, which nono
+        // cannot canonicalize. Inherited descriptors need no grant, so skip.
         capabilities
             .allow_file(path, access)
             .with_context(|| format!("could not grant access to {}", path.display()))
