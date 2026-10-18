@@ -37,7 +37,7 @@ struct SlashCommand {
     visible: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 9] = [
+const SLASH_COMMANDS: [SlashCommand; 10] = [
     SlashCommand {
         name: "/provider",
         description: "choose or reconnect a provider",
@@ -66,6 +66,11 @@ const SLASH_COMMANDS: [SlashCommand; 9] = [
     SlashCommand {
         name: "/help",
         description: "show available commands",
+        visible: true,
+    },
+    SlashCommand {
+        name: "/detach",
+        description: "keep this session running and detach",
         visible: true,
     },
     SlashCommand {
@@ -212,6 +217,7 @@ pub struct App {
     conversation_max_scroll: u16,
     follow_output: bool,
     command_selection: usize,
+    force_redraw: bool,
     should_quit: bool,
 }
 
@@ -268,6 +274,7 @@ impl App {
             conversation_max_scroll: 0,
             follow_output: true,
             command_selection: 0,
+            force_redraw: false,
             should_quit: false,
         }
     }
@@ -275,6 +282,10 @@ impl App {
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         let mut terminal_events = EventStream::new();
         while !self.should_quit {
+            if self.force_redraw {
+                terminal.clear()?;
+                self.force_redraw = false;
+            }
             terminal.draw(|frame| self.render(frame))?;
             tokio::select! {
                 terminal_event = terminal_events.next() => match terminal_event {
@@ -946,6 +957,10 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         match (key.code, key.modifiers) {
+            (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
+                self.force_redraw = true;
+                true
+            }
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 if self.request.is_some() {
                     self.interrupt_active();
@@ -1066,6 +1081,10 @@ impl App {
             "/model" => self.open_model_picker(),
             "/reasoning" => self.open_reasoning_picker(),
             "/new" => self.begin_new_session(),
+            "/detach" => match crate::sessions::request_detach() {
+                Ok(()) => self.push(Role::System, "Session detached."),
+                Err(error) => self.push(Role::Error, format!("Could not detach: {error:#}")),
+            },
             "/help" => self.push(Role::System, Self::command_help()),
             _ if self.request.is_some() => {
                 self.queued_request = Some(content);
@@ -1588,6 +1607,7 @@ mod tests {
         assert!(help.contains("/provider"));
         assert!(help.contains("/reasoning"));
         assert!(help.contains("/q"));
+        assert!(help.contains("/detach"));
         assert!(!help.lines().any(|line| line.starts_with("/quit")));
     }
 

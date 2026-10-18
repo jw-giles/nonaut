@@ -56,10 +56,27 @@ provider, model, and reasoning effort.
 | `/reasoning` | Select reasoning effort |
 | `/new` | Start a fresh session |
 | `/clear` | Clear the screen |
+| `/detach` | Keep the session running and return to the shell |
 | `/q` | Quit |
 
 `Shift+Enter` inserts a newline. `Esc` interrupts an active response. Sending a
 new prompt while streaming interrupts the current response first.
+
+Detached sessions keep their active provider and conversation in a local
+worker. They are created only when `/detach` is used and expire after 24 hours
+while detached.
+
+```sh
+nonaut ps
+nonaut attach <session>
+nonaut kill <session>
+nonaut kill --all # -a also works
+```
+
+Session metadata follows XDG and is stored under
+`$XDG_STATE_HOME/nonaut/sessions`, defaulting to
+`~/.local/state/nonaut/sessions`. Provider credentials are never copied into
+session metadata.
 
 ## Development
 
