@@ -1254,8 +1254,9 @@ impl App {
         self.push(
             Role::System,
             format!(
-                "Connecting to {}… Browser sign-in opens if needed.",
-                provider.display_name()
+                "Connecting to {}… {}",
+                provider.display_name(),
+                provider.connect_hint()
             ),
         );
         self.connection = Some(tokio::spawn(async move {

@@ -31,15 +31,16 @@ crosses the nono boundary.
 
 ## Run
 
-Requires a compatible `codex` CLI with app-server support and Rust 1.99.1.
-Nono 0.80 is embedded directly; no separate `nono` installation is needed.
+Requires Rust 1.99.1 and either a compatible `codex` CLI with app-server
+support or an Anthropic API key in `ANTHROPIC_API_KEY`. Nono 0.80 is embedded
+directly; no separate `nono` installation is needed.
 
 ```sh
 make run
 ```
 
-Nonaut reuses your existing Codex login and remembers the selected provider,
-model, and reasoning effort.
+Nonaut reuses your existing Codex login or `ANTHROPIC_API_KEY` and remembers
+the selected provider, model, and reasoning effort.
 
 | Command | Action |
 | --- | --- |

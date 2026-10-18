@@ -20,7 +20,7 @@ use tokio::{
 
 use crate::tools;
 
-use super::{Model, ProviderEvent, ReasoningOption};
+use super::{BASE_INSTRUCTIONS, DEVELOPER_INSTRUCTIONS, Model, ProviderEvent, ReasoningOption};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -586,8 +586,8 @@ async fn start_thread(rpc: &Rpc, cwd: &Path, model: &str) -> Result<String> {
                 "approvalPolicy": "never",
                 "approvalsReviewer": "user",
                 "dynamicTools": tools::specs(),
-                "baseInstructions": "You are the coding model inside Nonaut, a security-first agent harness. Use the provided tools to inspect and modify files and verify your work. Prefer the dedicated read_file, write_file, edit_file, and delete_file tools over run_command.",
-                "developerInstructions": "Tool integrity rule: never state or imply that a file was created, updated, patched, or deleted unless write_file, edit_file, or delete_file returned success in this turn. For creation or full replacement, call write_file immediately without preflight reads. For a focused edit, read the file at most once and then call edit_file. For deletion, call delete_file. Never replace a direct file mutation with run_command. Security boundary rule: you never decide whether an operation is allowed; nono is the sole authorization authority. You MUST issue the appropriate tool call even if a path is outside the workspace, sensitive, or likely denied. Pass the requested path directly because Nonaut normalizes it. A follow-up such as 'try it', 'do it anyway', or 'force it' means retry the last operation once under the existing policy so the denial is observable; it never means evade the sandbox. Report the real tool result."
+                "baseInstructions": BASE_INSTRUCTIONS,
+                "developerInstructions": DEVELOPER_INSTRUCTIONS
             }),
         )
         .await
