@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io, path::PathBuf};
+use std::{collections::HashMap, io, path::PathBuf, time::Duration};
 
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
@@ -12,7 +12,11 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
 };
 use ratatui_textarea::TextArea;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::mpsc,
+    task::JoinHandle,
+    time::{self, MissedTickBehavior},
+};
 use tui_markdown::{Options as MarkdownOptions, StyleSheet, from_str_with_options};
 
 use crate::{
@@ -28,6 +32,8 @@ const BORDER: Color = Color::Rgb(50, 50, 49);
 const ACCENT: Color = Color::Rgb(232, 115, 74);
 const ADDED: Color = Color::Rgb(126, 198, 153);
 const REMOVED: Color = Color::Rgb(224, 108, 117);
+// Driven by the event loop, not the terminal, so a frozen app stops blinking.
+const CURSOR_BLINK: Duration = Duration::from_millis(530);
 const BRAND_MARK: &str = "⎔";
 
 #[derive(Clone, Copy)]
@@ -224,6 +230,7 @@ pub struct App {
     follow_output: bool,
     command_selection: usize,
     force_redraw: bool,
+    cursor_visible: bool,
     should_quit: bool,
 }
 
@@ -282,12 +289,15 @@ impl App {
             follow_output: true,
             command_selection: 0,
             force_redraw: false,
+            cursor_visible: true,
             should_quit: false,
         }
     }
 
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         let mut terminal_events = EventStream::new();
+        let mut blink = time::interval(CURSOR_BLINK);
+        blink.set_missed_tick_behavior(MissedTickBehavior::Delay);
         while !self.should_quit {
             if self.force_redraw {
                 terminal.clear()?;
@@ -295,8 +305,14 @@ impl App {
             }
             terminal.draw(|frame| self.render(frame))?;
             tokio::select! {
+                _ = blink.tick() => self.cursor_visible = !self.cursor_visible,
                 terminal_event = terminal_events.next() => match terminal_event {
-                    Some(Ok(event)) => self.handle_terminal_event(event),
+                    Some(Ok(event)) => {
+                        // Keep the cursor solid while the user is typing.
+                        self.cursor_visible = true;
+                        blink.reset();
+                        self.handle_terminal_event(event);
+                    }
                     Some(Err(error)) => return Err(error),
                     None => self.should_quit = true,
                 },
@@ -513,6 +529,11 @@ impl App {
                 .scroll((self.conversation_scroll, 0)),
             conversation,
         );
+        self.input.set_cursor_style(if self.cursor_visible {
+            Style::new().bg(ACCENT).fg(BACKGROUND)
+        } else {
+            Style::new().fg(FOREGROUND).bg(SURFACE)
+        });
         frame.render_widget(&self.input, prompt);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
