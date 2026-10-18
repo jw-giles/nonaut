@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io, path::PathBuf};
+use std::{collections::HashMap, io, path::PathBuf, sync::LazyLock, time::Duration};
 
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
@@ -7,12 +7,16 @@ use futures_util::StreamExt;
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
 };
 use ratatui_textarea::TextArea;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::mpsc,
+    task::JoinHandle,
+    time::{self, MissedTickBehavior},
+};
 use tui_markdown::{Options as MarkdownOptions, StyleSheet, from_str_with_options};
 
 use crate::{
@@ -20,15 +24,56 @@ use crate::{
     providers::{Model, Provider, ProviderEvent, ProviderKind, ReasoningOption},
 };
 
-const BACKGROUND: Color = Color::Rgb(17, 17, 16);
-const SURFACE: Color = Color::Rgb(25, 25, 24);
-const FOREGROUND: Color = Color::Rgb(232, 232, 232);
-const MUTED: Color = Color::Rgb(136, 136, 136);
-const BORDER: Color = Color::Rgb(50, 50, 49);
-const ACCENT: Color = Color::Rgb(232, 115, 74);
-const ADDED: Color = Color::Rgb(126, 198, 153);
-const REMOVED: Color = Color::Rgb(224, 108, 117);
+struct Palette {
+    background: Color,
+    surface: Color,
+    foreground: Color,
+    muted: Color,
+    border: Color,
+    accent: Color,
+    added: Color,
+    removed: Color,
+}
+
+// One accent; everything else greyscale except diffs and failures.
+// Text colours meet 4.5:1 against their background in both themes.
+const DARK: Palette = Palette {
+    background: Color::Rgb(0, 0, 0),
+    surface: Color::Rgb(14, 14, 14),
+    foreground: Color::Rgb(237, 237, 237),
+    muted: Color::Rgb(163, 163, 163),
+    border: Color::Rgb(51, 51, 51),
+    accent: Color::Rgb(232, 115, 74),
+    added: Color::Rgb(62, 245, 140),
+    removed: Color::Rgb(255, 69, 69),
+};
+
+const LIGHT: Palette = Palette {
+    background: Color::Rgb(255, 255, 255),
+    surface: Color::Rgb(242, 242, 242),
+    foreground: Color::Rgb(26, 26, 26),
+    muted: Color::Rgb(64, 64, 64),
+    border: Color::Rgb(208, 208, 208),
+    // The dark-theme orange is 3.0:1 on white; this one is 4.7:1.
+    accent: Color::Rgb(196, 80, 27),
+    added: Color::Rgb(0, 135, 58),
+    removed: Color::Rgb(217, 0, 27),
+};
+
+// NONAUT_THEME=light selects the light palette; anything else is dark.
+static PALETTE: LazyLock<Palette> = LazyLock::new(|| {
+    if std::env::var("NONAUT_THEME").is_ok_and(|theme| theme.eq_ignore_ascii_case("light")) {
+        LIGHT
+    } else {
+        DARK
+    }
+});
+// Driven by the event loop, not the terminal, so a frozen app stops blinking.
+const CURSOR_BLINK: Duration = Duration::from_millis(530);
 const BRAND_MARK: &str = "⎔";
+// The prompt starts two lines tall and grows with newlines up to this many.
+const PROMPT_MIN_LINES: usize = 2;
+const PROMPT_MAX_LINES: usize = 10;
 
 #[derive(Clone, Copy)]
 struct SlashCommand {
@@ -100,27 +145,27 @@ struct NonautMarkdown;
 
 impl StyleSheet for NonautMarkdown {
     fn heading(&self, _level: u8) -> Style {
-        Style::new().fg(ACCENT).bold()
+        Style::new().fg(PALETTE.accent).bold()
     }
 
     fn code(&self) -> Style {
-        Style::new().fg(FOREGROUND).bg(SURFACE)
+        Style::new().fg(PALETTE.foreground).bg(PALETTE.surface)
     }
 
     fn link(&self) -> Style {
-        Style::new().fg(ACCENT).underlined()
+        Style::new().fg(PALETTE.accent).underlined()
     }
 
     fn blockquote(&self) -> Style {
-        Style::new().fg(MUTED).italic()
+        Style::new().fg(PALETTE.muted).italic()
     }
 
     fn heading_meta(&self) -> Style {
-        Style::new().fg(MUTED)
+        Style::new().fg(PALETTE.muted)
     }
 
     fn metadata_block(&self) -> Style {
-        Style::new().fg(MUTED)
+        Style::new().fg(PALETTE.muted)
     }
 
     fn code_block_fence(&self) -> &str {
@@ -128,23 +173,23 @@ impl StyleSheet for NonautMarkdown {
     }
 
     fn html(&self) -> Style {
-        Style::new().fg(MUTED)
+        Style::new().fg(PALETTE.muted)
     }
 
     fn table_header(&self) -> Style {
-        Style::new().fg(ACCENT).bold()
+        Style::new().fg(PALETTE.accent).bold()
     }
 
     fn table_cell(&self) -> Style {
-        Style::new().fg(FOREGROUND)
+        Style::new().fg(PALETTE.foreground)
     }
 
     fn table_border(&self) -> Style {
-        Style::new().fg(BORDER)
+        Style::new().fg(PALETTE.border)
     }
 
     fn list_marker(&self) -> Style {
-        Style::new().fg(ACCENT)
+        Style::new().fg(PALETTE.accent)
     }
 }
 
@@ -224,6 +269,7 @@ pub struct App {
     follow_output: bool,
     command_selection: usize,
     force_redraw: bool,
+    cursor_visible: bool,
     should_quit: bool,
 }
 
@@ -282,12 +328,15 @@ impl App {
             follow_output: true,
             command_selection: 0,
             force_redraw: false,
+            cursor_visible: true,
             should_quit: false,
         }
     }
 
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         let mut terminal_events = EventStream::new();
+        let mut blink = time::interval(CURSOR_BLINK);
+        blink.set_missed_tick_behavior(MissedTickBehavior::Delay);
         while !self.should_quit {
             if self.force_redraw {
                 terminal.clear()?;
@@ -295,8 +344,14 @@ impl App {
             }
             terminal.draw(|frame| self.render(frame))?;
             tokio::select! {
+                _ = blink.tick() => self.cursor_visible = !self.cursor_visible,
                 terminal_event = terminal_events.next() => match terminal_event {
-                    Some(Ok(event)) => self.handle_terminal_event(event),
+                    Some(Ok(event)) => {
+                        // Keep the cursor solid while the user is typing.
+                        self.cursor_visible = true;
+                        blink.reset();
+                        self.handle_terminal_event(event);
+                    }
                     Some(Err(error)) => return Err(error),
                     None => self.should_quit = true,
                 },
@@ -324,39 +379,60 @@ impl App {
 
     fn new_input() -> TextArea<'static> {
         let mut input = TextArea::default();
-        input.set_block(
-            Block::new()
-                .borders(Borders::ALL)
-                .border_style(Style::new().fg(ACCENT))
-                .style(Style::new().bg(SURFACE))
-                .title(Line::from(" prompt ").style(Style::new().fg(ACCENT).bold()))
-                .padding(Padding::horizontal(1)),
-        );
-        input.set_style(Style::new().fg(FOREGROUND).bg(SURFACE));
-        input.set_cursor_line_style(Style::new().bg(SURFACE));
-        input.set_cursor_style(Style::new().bg(ACCENT).fg(BACKGROUND));
+        input.set_block(Self::prompt_block(0));
+        input.set_style(Style::new().fg(PALETTE.foreground).bg(PALETTE.background));
+        input.set_cursor_line_style(Style::new().bg(PALETTE.background));
+        input.set_cursor_style(Style::new().bg(PALETTE.accent).fg(PALETTE.background));
         input.set_placeholder_text("Ask anything…");
-        input.set_placeholder_style(Style::new().fg(MUTED));
+        input.set_placeholder_style(Style::new().fg(PALETTE.muted));
         input
+    }
+
+    /// Rounded prompt with the token count in the top border and the key
+    /// hints in the bottom border, so no separate footer row is needed.
+    fn prompt_block(tokens: u64) -> Block<'static> {
+        let key = Style::new().fg(PALETTE.foreground);
+        let label = Style::new().fg(PALETTE.muted);
+        Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(PALETTE.accent))
+            .style(Style::new().bg(PALETTE.background))
+            .title_top(Line::styled(" › ", Style::new().fg(PALETTE.accent).bold()))
+            .title_top(Line::styled(format!(" {tokens} tokens "), label).right_aligned())
+            .title_bottom(Line::from(vec![
+                Span::styled(" Enter", key),
+                Span::styled(" send · ", label),
+                Span::styled("Shift+Enter", key),
+                Span::styled(" newline · ", label),
+                Span::styled("/q", key),
+                Span::styled(" quit ", label),
+            ]))
+            // Border plus padding puts typed text in the same column as message text.
+            .padding(Padding::new(4, 1, 0, 0))
     }
 
     fn render(&mut self, frame: &mut Frame) {
         frame.render_widget(
-            Block::new().style(Style::new().bg(BACKGROUND)),
+            Block::new().style(Style::new().bg(PALETTE.background)),
             frame.area(),
         );
-        let [header, conversation, prompt, footer] = Layout::vertical([
+        let prompt_lines = self
+            .input
+            .lines()
+            .len()
+            .clamp(PROMPT_MIN_LINES, PROMPT_MAX_LINES);
+        let [header, conversation, prompt] = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(5),
-            Constraint::Length(1),
+            Constraint::Length(u16::try_from(prompt_lines + 2).unwrap_or(u16::MAX)),
         ])
         .areas(frame.area());
         frame.render_widget(
             Block::new()
                 .borders(Borders::BOTTOM)
-                .border_style(BORDER)
-                .style(Style::new().bg(BACKGROUND)),
+                .border_style(PALETTE.border)
+                .style(Style::new().bg(PALETTE.background)),
             header,
         );
         let [_, header_content, _] = Layout::vertical([
@@ -367,37 +443,33 @@ impl App {
         .areas(header);
         let [brand, status] =
             Layout::horizontal([Constraint::Length(46), Constraint::Min(1)]).areas(header_content);
-        let [controls, usage] =
-            Layout::horizontal([Constraint::Min(1), Constraint::Length(20)]).areas(footer);
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(format!("  {BRAND_MARK}  "), Style::new().fg(ACCENT).bold()),
-                Span::styled("nonaut", Style::new().fg(FOREGROUND).bold()),
-                Span::styled(" · security-first agent harness", Style::new().fg(MUTED)),
-            ]))
-            .style(Style::new().bg(BACKGROUND)),
+            Paragraph::new(Line::from(vec![Span::styled(
+                format!("  {BRAND_MARK}  nonaut"),
+                Style::new().fg(PALETTE.accent).bold(),
+            )]))
+            .style(Style::new().bg(PALETTE.background)),
             brand,
         );
         frame.render_widget(
             Paragraph::new(format!(
-                "{} · {} · reasoning {} · tools sandboxed  ",
+                "{}   {}   reasoning {}   sandboxed  ",
                 self.provider_name, self.model_name, self.reasoning_effort
             ))
             .alignment(Alignment::Right)
-            .style(Style::new().fg(MUTED).bg(BACKGROUND)),
+            .style(Style::new().fg(PALETTE.muted).bg(PALETTE.background)),
             status,
         );
 
         let mut lines = Vec::new();
-        let divider = "─".repeat(usize::from(conversation.width.saturating_sub(6)));
         for message in &self.messages {
             match message.role {
                 Role::You => {
                     for (index, line) in message.content.lines().enumerate() {
-                        let marker = if index == 0 { "› " } else { "  " };
+                        let marker = if index == 0 { "›  " } else { "   " };
                         lines.push(Line::from(vec![
-                            Span::styled(marker, Style::new().fg(ACCENT).bold()),
-                            Span::styled(line, Style::new().fg(FOREGROUND).bold()),
+                            Span::styled(marker, Style::new().fg(PALETTE.accent).bold()),
+                            Span::styled(line, Style::new().fg(PALETTE.foreground).bold()),
                         ]));
                     }
                     lines.push(Line::default());
@@ -408,81 +480,36 @@ impl App {
                     let rendered = from_str_with_options(&message.content, &options);
                     lines.extend(rendered.lines);
                     lines.push(Line::default());
-                    lines.push(Line::from(Span::styled(
-                        divider.clone(),
-                        Style::new().fg(BORDER),
-                    )));
                     lines.push(Line::default());
                 }
-                Role::System => {
-                    for (index, line) in message.content.lines().enumerate() {
-                        let marker = if index == 0 { "· " } else { "  " };
-                        let content_style = if line.starts_with('+') && !line.starts_with("+++") {
-                            Style::new().fg(ADDED)
+                Role::System | Role::Running | Role::Success | Role::Error => {
+                    let border = match message.role {
+                        Role::Running => PALETTE.accent,
+                        Role::Error => PALETTE.removed,
+                        _ => PALETTE.border,
+                    };
+                    let rows = message.content.lines().enumerate().map(|(index, line)| {
+                        let style = if message.role == Role::Error && index == 0 {
+                            Style::new().fg(PALETTE.removed)
+                        } else if line.starts_with('+') && !line.starts_with("+++") {
+                            Style::new().fg(PALETTE.added)
                         } else if line.starts_with('-') && !line.starts_with("---") {
-                            Style::new().fg(REMOVED)
-                        } else if line.starts_with("@@") {
-                            Style::new().fg(ACCENT)
+                            Style::new().fg(PALETTE.removed)
                         } else {
-                            Style::new().fg(MUTED)
+                            Style::new().fg(PALETTE.muted)
                         };
+                        (line, style)
+                    });
+                    for (line, style) in rows {
                         lines.push(Line::from(vec![
-                            Span::styled(marker, Style::new().fg(ACCENT)),
-                            Span::styled(line, content_style),
+                            Span::raw("   "),
+                            Span::styled(line, style),
                         ]));
                     }
-                    lines.push(Line::default());
-                }
-                Role::Running => {
-                    for (index, line) in message.content.lines().enumerate() {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                if index == 0 {
-                                    "· ".to_owned()
-                                } else {
-                                    "  ".to_owned()
-                                },
-                                Style::new().fg(ACCENT).bold(),
-                            ),
-                            Span::styled(line, Style::new().fg(MUTED)),
-                        ]));
-                    }
-                    lines.push(Line::default());
-                }
-                Role::Success => {
-                    for (index, line) in message.content.lines().enumerate() {
-                        let marker = if index == 0 { "◆ " } else { "  " };
-                        let content_style = if line.starts_with('+') && !line.starts_with("+++") {
-                            Style::new().fg(ADDED)
-                        } else if line.starts_with('-') && !line.starts_with("---") {
-                            Style::new().fg(REMOVED)
-                        } else if line.starts_with("@@") {
-                            Style::new().fg(ACCENT)
-                        } else if index == 0 {
-                            Style::new().fg(ADDED)
-                        } else {
-                            Style::new().fg(MUTED)
-                        };
-                        lines.push(Line::from(vec![
-                            Span::styled(marker, Style::new().fg(ADDED).bold()),
-                            Span::styled(line, content_style),
-                        ]));
-                    }
-                    lines.push(Line::default());
-                }
-                Role::Error => {
-                    for (index, line) in message.content.lines().enumerate() {
-                        let marker = if index == 0 { "◆ " } else { "  " };
-                        let content_style = if index == 0 {
-                            Style::new().fg(REMOVED)
-                        } else {
-                            Style::new().fg(MUTED)
-                        };
-                        lines.push(Line::from(vec![
-                            Span::styled(marker, Style::new().fg(REMOVED).bold()),
-                            Span::styled(line, content_style),
-                        ]));
-                    }
+                    lines.push(Line::styled(
+                        "─".repeat(usize::from(conversation.width.saturating_sub(4))),
+                        Style::new().fg(border),
+                    ));
                     lines.push(Line::default());
                 }
             }
@@ -503,38 +530,24 @@ impl App {
         }
         frame.render_widget(
             Paragraph::new(lines)
-                .style(Style::new().fg(FOREGROUND).bg(BACKGROUND))
+                .style(Style::new().fg(PALETTE.foreground).bg(PALETTE.background))
                 .block(
                     Block::new()
-                        .style(Style::new().bg(BACKGROUND))
+                        .style(Style::new().bg(PALETTE.background))
                         .padding(Padding::horizontal(2)),
                 )
                 .wrap(Wrap { trim: false })
                 .scroll((self.conversation_scroll, 0)),
             conversation,
         );
+        self.input.set_cursor_style(if self.cursor_visible {
+            Style::new().bg(PALETTE.accent).fg(PALETTE.background)
+        } else {
+            Style::new().fg(PALETTE.foreground).bg(PALETTE.background)
+        });
+        self.input
+            .set_block(Self::prompt_block(self.session_tokens));
         frame.render_widget(&self.input, prompt);
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    " Enter",
-                    Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" send   ", Style::new().fg(MUTED)),
-                Span::styled("Shift+Enter", Style::new().fg(ACCENT)),
-                Span::styled(" newline   ", Style::new().fg(MUTED)),
-                Span::styled("/q", Style::new().fg(ACCENT)),
-                Span::styled(" quit", Style::new().fg(MUTED)),
-            ]))
-            .style(Style::new().bg(BACKGROUND)),
-            controls,
-        );
-        frame.render_widget(
-            Paragraph::new(format!("{} tokens  ", self.session_tokens))
-                .alignment(Alignment::Right)
-                .style(Style::new().fg(MUTED).bg(BACKGROUND)),
-            usage,
-        );
         if self.model_picker.is_none()
             && self.reasoning_picker.is_none()
             && self.provider_picker.is_none()
@@ -573,9 +586,12 @@ impl App {
             .map(|(index, command)| {
                 let marker = if index == selected { "›" } else { " " };
                 let style = if index == selected {
-                    Style::new().fg(BACKGROUND).bg(ACCENT).bold()
+                    Style::new()
+                        .fg(PALETTE.background)
+                        .bg(PALETTE.accent)
+                        .bold()
                 } else {
-                    Style::new().fg(FOREGROUND).bg(SURFACE)
+                    Style::new().fg(PALETTE.foreground).bg(PALETTE.surface)
                 };
                 Line::from(vec![
                     Span::styled(format!(" {marker} {:<12}", command.name), style),
@@ -584,7 +600,7 @@ impl App {
                         if index == selected {
                             style
                         } else {
-                            Style::new().fg(MUTED).bg(SURFACE)
+                            Style::new().fg(PALETTE.muted).bg(PALETTE.surface)
                         },
                     ),
                 ])
@@ -592,12 +608,14 @@ impl App {
             .collect::<Vec<_>>();
         frame.render_widget(Clear, popup);
         frame.render_widget(
-            Paragraph::new(lines).style(Style::new().bg(SURFACE)).block(
-                Block::new()
-                    .borders(Borders::ALL)
-                    .border_style(Style::new().fg(ACCENT))
-                    .title(" commands · ↑/↓ or Tab select · Enter run "),
-            ),
+            Paragraph::new(lines)
+                .style(Style::new().bg(PALETTE.surface))
+                .block(
+                    Block::new()
+                        .borders(Borders::ALL)
+                        .border_style(Style::new().fg(PALETTE.accent))
+                        .title(" commands · ↑/↓ or Tab select · Enter run "),
+                ),
             popup,
         );
     }
@@ -637,9 +655,12 @@ impl App {
                 };
                 let marker = if index == picker.selected { "›" } else { " " };
                 let style = if index == picker.selected {
-                    Style::new().fg(BACKGROUND).bg(ACCENT).bold()
+                    Style::new()
+                        .fg(PALETTE.background)
+                        .bg(PALETTE.accent)
+                        .bold()
                 } else {
-                    Style::new().fg(FOREGROUND).bg(SURFACE)
+                    Style::new().fg(PALETTE.foreground).bg(PALETTE.surface)
                 };
                 Line::styled(
                     format!(" {marker} {current} {}  {}", model.display_name, model.id),
@@ -648,12 +669,14 @@ impl App {
             })
             .collect::<Vec<_>>();
         frame.render_widget(
-            Paragraph::new(lines).style(Style::new().bg(SURFACE)).block(
-                Block::new()
-                    .borders(Borders::ALL)
-                    .border_style(Style::new().fg(ACCENT))
-                    .title(" model · ↑/↓ select · Enter apply · Esc close "),
-            ),
+            Paragraph::new(lines)
+                .style(Style::new().bg(PALETTE.surface))
+                .block(
+                    Block::new()
+                        .borders(Borders::ALL)
+                        .border_style(Style::new().fg(PALETTE.accent))
+                        .title(" model · ↑/↓ select · Enter apply · Esc close "),
+                ),
             popup,
         );
     }
@@ -687,26 +710,31 @@ impl App {
                 };
                 let marker = if index == picker.selected { "›" } else { " " };
                 let style = if index == picker.selected {
-                    Style::new().fg(BACKGROUND).bg(ACCENT).bold()
+                    Style::new()
+                        .fg(PALETTE.background)
+                        .bg(PALETTE.accent)
+                        .bold()
                 } else {
-                    Style::new().fg(FOREGROUND).bg(SURFACE)
+                    Style::new().fg(PALETTE.foreground).bg(PALETTE.surface)
                 };
                 [
                     Line::styled(format!(" {marker} {current} {}", option.id), style),
                     Line::styled(
                         format!("       {}", option.description),
-                        Style::new().fg(MUTED).bg(SURFACE),
+                        Style::new().fg(PALETTE.muted).bg(PALETTE.surface),
                     ),
                 ]
             })
             .collect::<Vec<_>>();
         frame.render_widget(
-            Paragraph::new(lines).style(Style::new().bg(SURFACE)).block(
-                Block::new()
-                    .borders(Borders::ALL)
-                    .border_style(Style::new().fg(ACCENT))
-                    .title(" reasoning · ↑/↓ select · Enter apply · Esc close "),
-            ),
+            Paragraph::new(lines)
+                .style(Style::new().bg(PALETTE.surface))
+                .block(
+                    Block::new()
+                        .borders(Borders::ALL)
+                        .border_style(Style::new().fg(PALETTE.accent))
+                        .title(" reasoning · ↑/↓ select · Enter apply · Esc close "),
+                ),
             popup,
         );
     }
@@ -740,9 +768,12 @@ impl App {
                 };
                 let marker = if index == picker.selected { "›" } else { " " };
                 let style = if index == picker.selected {
-                    Style::new().fg(BACKGROUND).bg(ACCENT).bold()
+                    Style::new()
+                        .fg(PALETTE.background)
+                        .bg(PALETTE.accent)
+                        .bold()
                 } else {
-                    Style::new().fg(FOREGROUND).bg(SURFACE)
+                    Style::new().fg(PALETTE.foreground).bg(PALETTE.surface)
                 };
                 [
                     Line::styled(
@@ -751,18 +782,20 @@ impl App {
                     ),
                     Line::styled(
                         format!("       {}", provider.description()),
-                        Style::new().fg(MUTED).bg(SURFACE),
+                        Style::new().fg(PALETTE.muted).bg(PALETTE.surface),
                     ),
                 ]
             })
             .collect::<Vec<_>>();
         frame.render_widget(
-            Paragraph::new(lines).style(Style::new().bg(SURFACE)).block(
-                Block::new()
-                    .borders(Borders::ALL)
-                    .border_style(Style::new().fg(ACCENT))
-                    .title(" provider · ↑/↓ select · Enter connect · Esc close "),
-            ),
+            Paragraph::new(lines)
+                .style(Style::new().bg(PALETTE.surface))
+                .block(
+                    Block::new()
+                        .borders(Borders::ALL)
+                        .border_style(Style::new().fg(PALETTE.accent))
+                        .title(" provider · ↑/↓ select · Enter connect · Esc close "),
+                ),
             popup,
         );
     }
@@ -1632,6 +1665,22 @@ mod tests {
         app.input.insert_str(value);
         app
     }
+    #[test]
+    fn prompt_grows_with_newlines_between_min_and_max() {
+        fn prompt_rows(value: &str) -> u16 {
+            let mut app = app_with_input(value);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 40)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let top = (0..40).find(|&y| buffer[(0, y)].symbol() == "╭").unwrap();
+            40 - top
+        }
+        assert_eq!(prompt_rows("one line"), 4);
+        assert_eq!(prompt_rows("a\nb\nc\nd"), 6);
+        assert_eq!(prompt_rows(&"line\n".repeat(20)), 12);
+    }
+
     #[test]
     fn submitting_text_adds_local_shell_messages() {
         let mut app = app_with_input("hello");
