@@ -13,17 +13,15 @@
 > control plane, while every model-requested tool runs in a fresh,
 > kernel-enforced sandbox.
 
-## Features
+## Usage
 
-- Kernel-enforced isolation for every model-requested tool execution.
-- Read/write access to the active workspace, with access outside it denied.
-- Network blocking and environment scrubbing inside tool sandboxes.
-- Codex / ChatGPT and Claude provider support.
-- Streaming terminal UI with model and reasoning selection.
-- Interruptible responses and commands.
-- Concise file diffs, tool summaries, and sandbox denial messages.
-- Explicitly persistent sessions with detach, attach, list, and kill commands.
-- Provider-free `exec` mode for direct sandbox use and policy testing.
+Nono 0.80 is embedded directly, so no separate `nono` installation is needed.
+Prebuilt binaries are published on the
+[GitHub Releases](https://github.com/SequeI/nonaut/releases) page.
+
+```sh
+nonaut
+```
 
 ## Preview
 
@@ -49,15 +47,7 @@ Nonaut currently supports two providers:
 - Claude through the official `claude` CLI and subscription login, with
   `ANTHROPIC_API_KEY` available as a fallback.
 
-## Usage
-
-Nono 0.80 is embedded directly, so no separate `nono` installation is needed.
-Prebuilt binaries are published on the
-[GitHub Releases](https://github.com/SequeI/nonaut/releases) page.
-
-```sh
-nonaut
-```
+## Commands
 
 Nonaut reuses your existing Codex or Claude login and remembers the selected
 provider, model, and reasoning effort.
