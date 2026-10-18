@@ -12,7 +12,8 @@ Nonaut is a minimal terminal agent for Codex / ChatGPT. The provider control
 plane handles authentication and inference; every model-requested tool runs in
 a fresh kernel-enforced sandbox.
 
-> Early stage: Codex / ChatGPT is the only provider and sessions are ephemeral.
+> [!NOTE]
+> Codex / ChatGPT is currently the only provider. Sessions are ephemeral.
 
 ## Preview
 
@@ -65,3 +66,9 @@ are also available.
 
 Set `NONO_BIN` to override nono discovery. Otherwise Nonaut prefers
 `~/.local/bin/nono` and falls back to `PATH`.
+
+## Releases
+
+Push a version tag matching `Cargo.toml`, such as `v0.0.1`, to publish signed
+build provenance, checksums, and binaries for Linux and macOS on x86_64 and
+ARM64.

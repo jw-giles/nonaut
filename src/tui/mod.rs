@@ -333,8 +333,6 @@ impl App {
             Constraint::Length(1),
         ])
         .areas(frame.area());
-        let [brand, status] =
-            Layout::horizontal([Constraint::Length(42), Constraint::Min(1)]).areas(header);
         frame.render_widget(
             Block::new()
                 .borders(Borders::BOTTOM)
@@ -342,11 +340,19 @@ impl App {
                 .style(Style::new().bg(BACKGROUND)),
             header,
         );
+        let [_, header_content, _] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(header);
+        let [brand, status] =
+            Layout::horizontal([Constraint::Length(46), Constraint::Min(1)]).areas(header_content);
         let [controls, usage] =
             Layout::horizontal([Constraint::Min(1), Constraint::Length(20)]).areas(footer);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("  ◆ ", Style::new().fg(ACCENT).bold()),
+                Span::styled("  🧑‍🚀  ", Style::new().fg(ACCENT).bold()),
                 Span::styled("nonaut", Style::new().fg(FOREGROUND).bold()),
                 Span::styled(" — security-first agent harness", Style::new().fg(MUTED)),
             ]))
