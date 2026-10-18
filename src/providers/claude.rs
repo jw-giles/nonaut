@@ -38,7 +38,7 @@ struct ModelInfo {
 }
 
 #[derive(Clone)]
-pub(crate) struct Claude {
+pub(crate) struct ClaudeApi {
     client: Client,
     base_url: String,
     cwd: PathBuf,
@@ -50,7 +50,7 @@ pub(crate) struct Claude {
     active: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
-impl Claude {
+impl ClaudeApi {
     pub async fn connect(cwd: &Path) -> Result<Self> {
         let key = std::env::var("ANTHROPIC_API_KEY")
             .ok()

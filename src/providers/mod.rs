@@ -1,4 +1,5 @@
 mod claude;
+mod claude_code;
 mod codex;
 
 use std::path::Path;
@@ -6,7 +7,8 @@ use std::path::Path;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use claude::Claude;
+use claude::ClaudeApi;
+use claude_code::ClaudeCode;
 use codex::Codex;
 
 pub(crate) const BASE_INSTRUCTIONS: &str = "You are the coding model inside Nonaut, a security-first agent harness. Use the provided tools to inspect and modify files and verify your work. Prefer the dedicated read_file, write_file, edit_file, and delete_file tools over run_command.";
@@ -32,21 +34,21 @@ impl ProviderKind {
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::Codex => "Codex / ChatGPT",
-            Self::Claude => "Claude (Anthropic API)",
+            Self::Claude => "Claude / Anthropic",
         }
     }
 
     pub const fn description(self) -> &'static str {
         match self {
             Self::Codex => "Existing Codex account · tools isolated by nono",
-            Self::Claude => "ANTHROPIC_API_KEY · tools isolated by nono",
+            Self::Claude => "Claude subscription or API key · tools isolated by nono",
         }
     }
 
     pub const fn connect_hint(self) -> &'static str {
         match self {
             Self::Codex => "Browser sign-in opens if needed.",
-            Self::Claude => "Using ANTHROPIC_API_KEY from the environment.",
+            Self::Claude => "Browser sign-in opens if needed.",
         }
     }
 
@@ -92,49 +94,63 @@ pub enum ProviderEvent {
 #[derive(Clone)]
 pub enum Provider {
     Codex(Codex),
-    Claude(Claude),
+    ClaudeApi(ClaudeApi),
+    ClaudeCode(ClaudeCode),
 }
 
 impl Provider {
     pub async fn connect(kind: ProviderKind, cwd: &Path) -> Result<Self> {
         match kind {
             ProviderKind::Codex => Codex::connect(cwd).await.map(Self::Codex),
-            ProviderKind::Claude => Claude::connect(cwd).await.map(Self::Claude),
+            ProviderKind::Claude => {
+                if ClaudeCode::is_logged_in().await
+                    || std::env::var_os("ANTHROPIC_API_KEY").is_none()
+                {
+                    ClaudeCode::connect(cwd).await.map(Self::ClaudeCode)
+                } else {
+                    ClaudeApi::connect(cwd).await.map(Self::ClaudeApi)
+                }
+            }
         }
     }
 
     pub fn model(&self) -> Model {
         match self {
             Self::Codex(provider) => provider.model(),
-            Self::Claude(provider) => provider.model(),
+            Self::ClaudeApi(provider) => provider.model(),
+            Self::ClaudeCode(provider) => provider.model(),
         }
     }
 
     pub fn models(&self) -> &[Model] {
         match self {
             Self::Codex(provider) => provider.models(),
-            Self::Claude(provider) => provider.models(),
+            Self::ClaudeApi(provider) => provider.models(),
+            Self::ClaudeCode(provider) => provider.models(),
         }
     }
 
     pub fn select_model(&self, model_id: &str) -> Result<Model> {
         match self {
             Self::Codex(provider) => provider.select_model(model_id),
-            Self::Claude(provider) => provider.select_model(model_id),
+            Self::ClaudeApi(provider) => provider.select_model(model_id),
+            Self::ClaudeCode(provider) => provider.select_model(model_id),
         }
     }
 
     pub fn select_reasoning_effort(&self, effort: &str) -> Result<String> {
         match self {
             Self::Codex(provider) => provider.select_reasoning_effort(effort),
-            Self::Claude(provider) => provider.select_reasoning_effort(effort),
+            Self::ClaudeApi(provider) => provider.select_reasoning_effort(effort),
+            Self::ClaudeCode(provider) => provider.select_reasoning_effort(effort),
         }
     }
 
     pub async fn new_session(&self) -> Result<()> {
         match self {
             Self::Codex(provider) => provider.new_session().await,
-            Self::Claude(provider) => provider.new_session().await,
+            Self::ClaudeApi(provider) => provider.new_session().await,
+            Self::ClaudeCode(provider) => provider.new_session().await,
         }
     }
 
@@ -146,14 +162,16 @@ impl Provider {
     ) -> Result<()> {
         match self {
             Self::Codex(provider) => provider.stream(input, request_id, sender).await,
-            Self::Claude(provider) => provider.stream(input, request_id, sender).await,
+            Self::ClaudeApi(provider) => provider.stream(input, request_id, sender).await,
+            Self::ClaudeCode(provider) => provider.stream(input, request_id, sender).await,
         }
     }
 
     pub async fn interrupt(&self) -> Result<()> {
         match self {
             Self::Codex(provider) => provider.interrupt().await,
-            Self::Claude(provider) => provider.interrupt().await,
+            Self::ClaudeApi(provider) => provider.interrupt().await,
+            Self::ClaudeCode(provider) => provider.interrupt().await,
         }
     }
 }

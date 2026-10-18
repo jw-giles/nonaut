@@ -1,10 +1,18 @@
 fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("__nonaut_sandbox") {
+    let mode = std::env::args().nth(1);
+    if mode.as_deref() == Some("__nonaut_sandbox") {
         return nonaut::run_sandbox();
     }
 
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(nonaut::run())
+        .build()?;
+    if mode.as_deref() == Some("__nonaut_mcp") {
+        let workspace = std::env::args_os()
+            .nth(2)
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("MCP workspace was not provided"))?;
+        return runtime.block_on(nonaut::run_mcp(workspace));
+    }
+    runtime.block_on(nonaut::run())
 }

@@ -1,4 +1,5 @@
 mod config;
+mod mcp;
 mod providers;
 mod tools;
 mod tui;
@@ -16,6 +17,10 @@ use tui::App;
 
 pub fn run_sandbox() -> Result<()> {
     tools::run_sandbox().context("sandboxed tool failed")
+}
+
+pub async fn run_mcp(workspace: std::path::PathBuf) -> Result<()> {
+    mcp::run(workspace).await.context("MCP server failed")
 }
 
 pub async fn run() -> Result<()> {
