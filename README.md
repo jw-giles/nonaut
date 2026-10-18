@@ -16,7 +16,7 @@
 ## Preview
 
 <p align="center">
-  <img src="assets/nonaut-tui.png" alt="Nonaut terminal interface showing sandboxed tool execution">
+  <img src="assets/nonaut-preview.png" alt="Nonaut terminal interface showing sandboxed tool execution">
 </p>
 
 ## Security model
