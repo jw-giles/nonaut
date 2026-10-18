@@ -485,13 +485,16 @@ impl App {
                 Role::System | Role::Running | Role::Success | Role::Error => {
                     let border = match message.role {
                         Role::Running => PALETTE.accent,
+                        Role::Success => PALETTE.added,
                         Role::Error => PALETTE.removed,
                         _ => PALETTE.border,
                     };
                     let rows = message.content.lines().enumerate().map(|(index, line)| {
                         let style = if message.role == Role::Error && index == 0 {
                             Style::new().fg(PALETTE.removed)
-                        } else if line.starts_with('+') && !line.starts_with("+++") {
+                        } else if (message.role == Role::Success && index == 0)
+                            || (line.starts_with('+') && !line.starts_with("+++"))
+                        {
                             Style::new().fg(PALETTE.added)
                         } else if line.starts_with('-') && !line.starts_with("---") {
                             Style::new().fg(PALETTE.removed)
@@ -501,10 +504,7 @@ impl App {
                         (line, style)
                     });
                     for (line, style) in rows {
-                        lines.push(Line::from(vec![
-                            Span::raw("   "),
-                            Span::styled(line, style),
-                        ]));
+                        lines.push(Line::styled(line, style));
                     }
                     lines.push(Line::styled(
                         "─".repeat(usize::from(conversation.width.saturating_sub(4))),

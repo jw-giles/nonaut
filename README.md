@@ -32,7 +32,7 @@ nonaut
 ## Preview
 
 <p align="center">
-  <img src="assets/nonaut-preview.png" alt="Nonaut terminal interface showing sandboxed tool execution">
+  <img src="assets/nonaut-preview.png" alt="Nonaut terminal interface showing workspace access and a blocked sandbox request">
 </p>
 
 ## Security model
