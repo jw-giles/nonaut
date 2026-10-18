@@ -30,6 +30,61 @@ const ADDED: Color = Color::Rgb(126, 198, 153);
 const REMOVED: Color = Color::Rgb(224, 108, 117);
 
 #[derive(Clone, Copy)]
+struct SlashCommand {
+    name: &'static str,
+    description: &'static str,
+    visible: bool,
+}
+
+const SLASH_COMMANDS: [SlashCommand; 9] = [
+    SlashCommand {
+        name: "/provider",
+        description: "choose or reconnect a provider",
+        visible: true,
+    },
+    SlashCommand {
+        name: "/model",
+        description: "choose a provider model",
+        visible: true,
+    },
+    SlashCommand {
+        name: "/reasoning",
+        description: "choose model reasoning effort",
+        visible: true,
+    },
+    SlashCommand {
+        name: "/new",
+        description: "start a fresh session",
+        visible: true,
+    },
+    SlashCommand {
+        name: "/clear",
+        description: "clear the screen",
+        visible: true,
+    },
+    SlashCommand {
+        name: "/help",
+        description: "show available commands",
+        visible: true,
+    },
+    SlashCommand {
+        name: "/q",
+        description: "leave nonaut",
+        visible: true,
+    },
+    SlashCommand {
+        name: "/quit",
+        description: "leave nonaut",
+        visible: false,
+    },
+    SlashCommand {
+        name: "/exit",
+        description: "leave nonaut",
+        visible: false,
+    },
+];
+
+#[derive(Clone, Copy)]
 struct NonautMarkdown;
 
 impl StyleSheet for NonautMarkdown {
@@ -155,6 +210,7 @@ pub struct App {
     conversation_scroll: u16,
     conversation_max_scroll: u16,
     follow_output: bool,
+    command_selection: usize,
     should_quit: bool,
 }
 
@@ -210,6 +266,7 @@ impl App {
             conversation_scroll: 0,
             conversation_max_scroll: 0,
             follow_output: true,
+            command_selection: 0,
             should_quit: false,
         }
     }
@@ -453,6 +510,12 @@ impl App {
                 .style(Style::new().fg(MUTED).bg(BACKGROUND)),
             usage,
         );
+        if self.model_picker.is_none()
+            && self.reasoning_picker.is_none()
+            && self.provider_picker.is_none()
+        {
+            self.render_command_menu(frame, prompt);
+        }
         if let Some(picker) = &self.model_picker {
             self.render_model_picker(frame, picker);
         }
@@ -462,6 +525,56 @@ impl App {
         if let Some(picker) = &self.provider_picker {
             self.render_provider_picker(frame, picker);
         }
+    }
+
+    fn render_command_menu(&self, frame: &mut Frame, prompt: Rect) {
+        let commands = self.matching_commands();
+        if commands.is_empty() {
+            return;
+        }
+        let height = u16::try_from(commands.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+            .min(prompt.y);
+        if height < 3 {
+            return;
+        }
+        let width = frame.area().width.saturating_sub(4).min(72);
+        let popup = Rect::new(prompt.x.saturating_add(2), prompt.y - height, width, height);
+        let selected = self.command_selection.min(commands.len().saturating_sub(1));
+        let lines = commands
+            .iter()
+            .enumerate()
+            .map(|(index, command)| {
+                let marker = if index == selected { "›" } else { " " };
+                let style = if index == selected {
+                    Style::new().fg(BACKGROUND).bg(ACCENT).bold()
+                } else {
+                    Style::new().fg(FOREGROUND).bg(SURFACE)
+                };
+                Line::from(vec![
+                    Span::styled(format!(" {marker} {:<12}", command.name), style),
+                    Span::styled(
+                        format!(" {}", command.description),
+                        if index == selected {
+                            style
+                        } else {
+                            Style::new().fg(MUTED).bg(SURFACE)
+                        },
+                    ),
+                ])
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::new().bg(SURFACE)).block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .border_style(Style::new().fg(ACCENT))
+                    .title(" commands · ↑/↓ or Tab select · Enter run "),
+            ),
+            popup,
+        );
     }
 
     fn render_model_picker(&self, frame: &mut Frame, picker: &ModelPicker) {
@@ -669,6 +782,7 @@ impl App {
             return;
         }
         self.input.input(event);
+        self.command_selection = 0;
     }
 
     fn handle_provider_picker_key(&mut self, key: KeyEvent) {
@@ -842,6 +956,7 @@ impl App {
                 self.input.insert_newline();
                 true
             }
+            _ if self.handle_command_key(key) => true,
             (KeyCode::Enter, modifiers) if !modifiers.contains(KeyModifiers::SHIFT) => {
                 self.submit();
                 true
@@ -856,6 +971,52 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    fn handle_command_key(&mut self, key: KeyEvent) -> bool {
+        let command_count = self.matching_commands().len();
+        if command_count == 0 {
+            return false;
+        }
+        match key.code {
+            KeyCode::Up => {
+                self.command_selection = self.command_selection.saturating_sub(1);
+                true
+            }
+            KeyCode::Down => {
+                self.command_selection = (self.command_selection + 1).min(command_count - 1);
+                true
+            }
+            KeyCode::Tab => {
+                self.command_selection = (self.command_selection + 1) % command_count;
+                true
+            }
+            KeyCode::Enter => {
+                let command = self.matching_commands()
+                    [self.command_selection.min(command_count.saturating_sub(1))]
+                .name;
+                self.input = Self::new_input();
+                self.input.insert_str(command);
+                self.command_selection = 0;
+                self.submit();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn matching_commands(&self) -> Vec<&'static SlashCommand> {
+        let lines = self.input.lines();
+        let Some(input) = lines.first().map(String::as_str) else {
+            return Vec::new();
+        };
+        if lines.len() != 1 || !input.starts_with('/') || input.chars().any(char::is_whitespace) {
+            return Vec::new();
+        }
+        SLASH_COMMANDS
+            .iter()
+            .filter(|command| command.visible && command.name.starts_with(input))
+            .collect()
     }
 
     fn scroll_conversation_up(&mut self, lines: u16) {
@@ -898,16 +1059,22 @@ impl App {
             "/model" => self.open_model_picker(),
             "/reasoning" => self.open_reasoning_picker(),
             "/new" => self.begin_new_session(),
-            "/help" => self.push(
-                Role::System,
-                "/help       show this message\n/provider   choose or reconnect a provider\n/model      choose a provider model\n/reasoning  choose model reasoning effort\n/new        start a fresh session\n/clear      clear the screen\n/q, /quit   leave nonaut",
-            ),
+            "/help" => self.push(Role::System, Self::command_help()),
             _ if self.request.is_some() => {
                 self.queued_request = Some(content);
                 self.interrupt_active();
             }
             _ => self.begin_request(content),
         }
+    }
+
+    fn command_help() -> String {
+        SLASH_COMMANDS
+            .iter()
+            .filter(|command| command.visible)
+            .map(|command| format!("{:<12} {}", command.name, command.description))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn interrupt_active(&self) {
@@ -1370,6 +1537,50 @@ mod tests {
         let mut app = app_with_input("/q");
         app.submit();
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn tab_cycles_commands_and_wraps() {
+        let mut app = app_with_input("/");
+        let command_count = app.matching_commands().len();
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert_eq!(app.command_selection, 1);
+        assert_eq!(app.input.lines(), ["/"]);
+
+        for _ in 1..command_count {
+            app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        assert_eq!(app.command_selection, 0);
+    }
+
+    #[test]
+    fn enter_runs_the_selected_slash_command() {
+        let mut app = app_with_input("/pro");
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(app.provider_picker.is_some());
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn slash_command_menu_hides_exit_aliases() {
+        let app = app_with_input("/qui");
+        assert!(app.matching_commands().is_empty());
+    }
+
+    #[test]
+    fn exit_alias_still_exits() {
+        let mut app = app_with_input("/exit");
+        app.submit();
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn help_is_generated_from_the_command_registry() {
+        let help = App::command_help();
+        assert!(help.contains("/provider"));
+        assert!(help.contains("/reasoning"));
+        assert!(help.contains("/q"));
+        assert!(!help.lines().any(|line| line.starts_with("/quit")));
     }
 
     #[test]
