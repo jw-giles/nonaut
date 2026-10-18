@@ -33,8 +33,8 @@ crosses the nono boundary.
 
 ## Run
 
-Requires a compatible `codex` CLI with app-server support, `nono` 0.79 or
-newer, and Rust 1.99.1.
+Requires a compatible `codex` CLI with app-server support and Rust 1.99.1.
+Nono 0.80 is embedded directly; no separate `nono` installation is needed.
 
 ```sh
 make run
@@ -63,9 +63,6 @@ make check
 
 `make fmt`, `make lint`, `make test`, `make build`, `make smoke`, and `make run`
 are also available.
-
-Set `NONO_BIN` to override nono discovery. Otherwise Nonaut prefers
-`~/.local/bin/nono` and falls back to `PATH`.
 
 ## Releases
 

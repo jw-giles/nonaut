@@ -28,6 +28,7 @@ const BORDER: Color = Color::Rgb(50, 50, 49);
 const ACCENT: Color = Color::Rgb(232, 115, 74);
 const ADDED: Color = Color::Rgb(126, 198, 153);
 const REMOVED: Color = Color::Rgb(224, 108, 117);
+const BRAND_MARK: &str = "⎔";
 
 #[derive(Clone, Copy)]
 struct SlashCommand {
@@ -352,7 +353,7 @@ impl App {
             Layout::horizontal([Constraint::Min(1), Constraint::Length(20)]).areas(footer);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("  🧑‍🚀  ", Style::new().fg(ACCENT).bold()),
+                Span::styled(format!("  {BRAND_MARK}  "), Style::new().fg(ACCENT).bold()),
                 Span::styled("nonaut", Style::new().fg(FOREGROUND).bold()),
                 Span::styled(" — security-first agent harness", Style::new().fg(MUTED)),
             ]))

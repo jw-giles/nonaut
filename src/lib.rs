@@ -14,11 +14,11 @@ use crossterm::{
 
 use tui::App;
 
-pub async fn run() -> Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("__nonaut_tool") {
-        return tools::run_worker().context("tool worker failed");
-    }
+pub fn run_sandbox() -> Result<()> {
+    tools::run_sandbox().context("sandboxed tool failed")
+}
 
+pub async fn run() -> Result<()> {
     let cwd = std::env::current_dir().context("could not determine the working directory")?;
     let (default_provider, startup_warning) = match config::load_default_provider() {
         Ok(provider) => (provider, None),

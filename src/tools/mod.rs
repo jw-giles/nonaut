@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     fs,
     io::{self, Read},
     path::{Component, Path, PathBuf},
@@ -6,9 +7,13 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use anyhow::{Context, Result, anyhow, bail};
 use diffy::create_patch;
 use directories::BaseDirs;
+use nono::{AccessMode, CapabilitySet, Sandbox};
 use serde_json::{Value, json};
 use tokio::{io::AsyncWriteExt, process::Command};
 
@@ -133,9 +138,10 @@ pub async fn execute(workspace: &Path, tool: &str, arguments: &Value) -> Result<
     }
 
     let executable = std::env::current_exe().context("could not locate the Nonaut executable")?;
-    let mut child = sandbox_command(workspace, workspace, &executable);
+    let mut child = sandbox_process(workspace, &executable);
     child
-        .arg("__nonaut_tool")
+        .arg("tool")
+        .arg(workspace)
         .arg(tool)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -311,8 +317,13 @@ async fn run_command(workspace: &Path, arguments: &Value) -> Result<String> {
         .unwrap_or(120)
         .clamp(1, 120);
 
-    let mut command = sandbox_command(workspace, Path::new(command_cwd), Path::new(program));
+    let executable = std::env::current_exe().context("could not locate the Nonaut executable")?;
+    let mut command = sandbox_process(workspace, &executable);
     command
+        .arg("command")
+        .arg(workspace)
+        .arg(command_cwd)
+        .arg(program)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -327,47 +338,18 @@ async fn run_command(workspace: &Path, arguments: &Value) -> Result<String> {
     output_result(program, output)
 }
 
-fn sandbox_command(workspace: &Path, workdir: &Path, program: &Path) -> Command {
-    let mut command = Command::new(nono_executable());
+fn sandbox_process(workspace: &Path, executable: &Path) -> Command {
+    let mut command = Command::new(executable);
     command
-        .arg("run")
-        .arg("--silent")
-        // Use an explicit capability instead of --allow-cwd. nono 0.79 can
-        // create files with --allow-cwd on macOS but denies replacing an
-        // existing file; --allow grants the intended read/write workspace.
-        .arg("--allow")
-        .arg(workspace)
-        .arg("--workdir")
-        .arg(workdir)
-        .arg("--block-net")
-        .arg("--")
-        .arg("/usr/bin/env")
-        .arg("-i")
-        .arg(format!("PATH={}", safe_path()))
-        .arg(format!("HOME={}", workspace.display()))
-        .arg(format!("TMPDIR={}", workspace.display()))
-        .arg("LANG=C.UTF-8")
-        .arg("TERM=dumb")
-        .arg(program)
+        .arg("__nonaut_sandbox")
+        .env_clear()
+        .env("PATH", safe_path())
+        .env("HOME", workspace)
+        .env("TMPDIR", workspace)
+        .env("LANG", "C.UTF-8")
+        .env("TERM", "dumb")
         .current_dir(workspace);
     command
-}
-
-fn nono_executable() -> PathBuf {
-    if let Some(path) = std::env::var_os("NONO_BIN").filter(|path| !path.is_empty()) {
-        return PathBuf::from(path);
-    }
-
-    // The official curl installer places nono here. Prefer it over an older
-    // package-manager copy that may appear earlier in the inherited PATH.
-    if let Some(base_dirs) = BaseDirs::new() {
-        let installed = base_dirs.home_dir().join(".local/bin/nono");
-        if installed.is_file() {
-            return installed;
-        }
-    }
-
-    PathBuf::from("nono")
 }
 
 fn safe_path() -> String {
@@ -446,24 +428,244 @@ fn truncate(value: &str) -> String {
     format!("{}\n[output truncated by Nonaut]", &value[..end])
 }
 
-pub fn run_worker() -> Result<()> {
-    let tool = std::env::args()
-        .nth(2)
-        .context("tool worker was not given a tool name")?;
+pub fn run_sandbox() -> Result<()> {
+    let mut arguments = std::env::args_os().skip(2);
+    let mode = arguments
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .context("sandbox mode was not provided")?;
+    let workspace = PathBuf::from(
+        arguments
+            .next()
+            .context("sandbox workspace was not provided")?,
+    );
+    let capabilities = sandbox_capabilities(&workspace)?;
+    Sandbox::apply_auto(&capabilities).context("could not apply the nono sandbox")?;
+
+    match mode.as_str() {
+        "tool" => {
+            let tool = arguments
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .context("sandboxed tool name was not provided")?;
+            run_tool_worker(&workspace, &tool)
+        }
+        "command" => run_sandboxed_command(&workspace, arguments.collect()),
+        _ => bail!("unknown sandbox mode `{mode}`"),
+    }
+}
+
+fn sandbox_capabilities(workspace: &Path) -> Result<CapabilitySet> {
+    let mut capabilities = CapabilitySet::new().block_network();
+    for path in system_read_paths() {
+        capabilities = allow_existing(capabilities, Path::new(path), AccessMode::Read)?;
+    }
+    for path in system_write_paths() {
+        capabilities = allow_existing(capabilities, Path::new(path), AccessMode::Write)?;
+    }
+    for path in safe_path().split(':') {
+        capabilities = allow_existing(capabilities, Path::new(path), AccessMode::Read)?;
+    }
+    capabilities = capabilities
+        .allow_path(workspace, AccessMode::ReadWrite)
+        .context("could not grant workspace access")?;
+    Ok(capabilities)
+}
+
+fn allow_existing(
+    capabilities: CapabilitySet,
+    path: &Path,
+    access: AccessMode,
+) -> Result<CapabilitySet> {
+    if path.is_dir() {
+        capabilities
+            .allow_path(path, access)
+            .with_context(|| format!("could not grant access to {}", path.display()))
+    } else if path.exists() {
+        capabilities
+            .allow_file(path, access)
+            .with_context(|| format!("could not grant access to {}", path.display()))
+    } else {
+        Ok(capabilities)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn system_read_paths() -> &'static [&'static str] {
+    &[
+        "/bin",
+        "/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/local/bin",
+        "/usr/lib",
+        "/usr/local/lib",
+        "/usr/share",
+        "/System/Library",
+        "/Library",
+        "/dev",
+        "/private/var/db",
+        "/private/etc",
+        "/usr/share/zoneinfo",
+        "/usr/share/locale",
+        "/var/db/timezone",
+        "/usr/share/terminfo",
+        "/var",
+        "/private/var",
+        "/private",
+        "/tmp",
+        "/System/Volumes",
+        "/System/Cryptexes",
+        "/Applications",
+        "/cores",
+        "/opt",
+        "/run",
+        "/nix",
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn system_read_paths() -> &'static [&'static str] {
+    &[
+        "/bin",
+        "/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/local/bin",
+        "/lib",
+        "/lib64",
+        "/lib/x86_64-linux-gnu",
+        "/lib/aarch64-linux-gnu",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+        "/usr/local/lib",
+        "/etc/resolv.conf",
+        "/etc/hosts",
+        "/etc/nsswitch.conf",
+        "/etc/gai.conf",
+        "/etc/group",
+        "/etc/ssl",
+        "/etc/pki",
+        "/etc/ca-certificates",
+        "/etc/ld.so.cache",
+        "/etc/ld.so.conf",
+        "/etc/ld.so.conf.d",
+        "/etc/localtime",
+        "/etc/timezone",
+        "/etc/alternatives",
+        "/etc/os-release",
+        "/etc/passwd",
+        "/etc/services",
+        "/usr/share",
+        "/usr/share/locale",
+        "/usr/share/zoneinfo",
+        "/usr/share/terminfo",
+        "/usr/share/ca-certificates",
+        "/lib/terminfo",
+        "/etc/terminfo",
+        "/dev/null",
+        "/dev/zero",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/full",
+        "/dev/tty",
+        "/dev/stdin",
+        "/dev/stdout",
+        "/dev/stderr",
+        "/dev/fd",
+        "/dev/pts",
+        "/proc/self",
+        "/proc/cpuinfo",
+        "/proc/meminfo",
+        "/proc/stat",
+        "/proc/loadavg",
+        "/proc/version",
+        "/proc/filesystems",
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn system_write_paths() -> &'static [&'static str] {
+    &[
+        "/private/tmp",
+        "/tmp",
+        "/private/var/folders",
+        "/var/folders",
+        "/dev",
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn system_write_paths() -> &'static [&'static str] {
+    &[
+        "/tmp",
+        "/dev/null",
+        "/dev/zero",
+        "/dev/full",
+        "/dev/tty",
+        "/dev/stdout",
+        "/dev/stderr",
+        "/dev/fd",
+        "/dev/pts",
+        "/proc/self/fd",
+    ]
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn system_read_paths() -> &'static [&'static str] {
+    &[]
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn system_write_paths() -> &'static [&'static str] {
+    &[]
+}
+
+#[cfg(unix)]
+fn run_sandboxed_command(_workspace: &Path, arguments: Vec<OsString>) -> Result<()> {
+    let mut arguments = arguments.into_iter();
+    let workdir = PathBuf::from(
+        arguments
+            .next()
+            .context("sandboxed command working directory was not provided")?,
+    );
+    let program = arguments
+        .next()
+        .context("sandboxed command program was not provided")?;
+    let error = std::process::Command::new(&program)
+        .args(arguments)
+        .current_dir(workdir)
+        .env_clear()
+        .env("PATH", safe_path())
+        .env("HOME", _workspace)
+        .env("TMPDIR", _workspace)
+        .env("LANG", "C.UTF-8")
+        .env("TERM", "dumb")
+        .exec();
+    Err(error).with_context(|| format!("could not execute `{}`", program.to_string_lossy()))
+}
+
+#[cfg(not(unix))]
+fn run_sandboxed_command(_workspace: &Path, _arguments: Vec<OsString>) -> Result<()> {
+    bail!("sandboxed commands are only supported on Unix platforms")
+}
+
+fn run_tool_worker(workspace: &Path, tool: &str) -> Result<()> {
     let mut encoded = String::new();
     io::stdin()
         .take((MAX_OUTPUT_BYTES * 4) as u64)
         .read_to_string(&mut encoded)
         .context("could not read tool arguments")?;
     let arguments: Value = serde_json::from_str(&encoded).context("invalid tool arguments")?;
-    let workspace = std::env::current_dir().context("could not determine tool workspace")?;
-    let output = match tool.as_str() {
-        "read_file" => read_file(&workspace, &arguments),
-        "list_directory" => list_directory(&workspace, &arguments),
-        "write_file" => write_file(&workspace, &arguments),
-        "search_files" => search_files(&workspace, &arguments),
-        "edit_file" => edit_file(&workspace, &arguments),
-        "delete_file" => delete_file(&workspace, &arguments),
+    let output = match tool {
+        "read_file" => read_file(workspace, &arguments),
+        "list_directory" => list_directory(workspace, &arguments),
+        "write_file" => write_file(workspace, &arguments),
+        "search_files" => search_files(workspace, &arguments),
+        "edit_file" => edit_file(workspace, &arguments),
+        "delete_file" => delete_file(workspace, &arguments),
         _ => bail!("unknown tool `{tool}`"),
     }?;
     print!("{output}");
