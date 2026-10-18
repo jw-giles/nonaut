@@ -12,6 +12,12 @@ a fresh kernel-enforced sandbox.
 
 > Early stage: Codex / ChatGPT is the only provider and sessions are ephemeral.
 
+## Preview
+
+<p align="center">
+  <img src="assets/nonaut-tui.png" alt="Nonaut terminal interface showing sandboxed tool execution">
+</p>
+
 ## Security model
 
 - Workspace access is read/write; everything outside it is denied.
@@ -28,7 +34,7 @@ Requires a compatible `codex` CLI with app-server support, `nono` 0.79 or
 newer, and Rust 1.99.1.
 
 ```sh
-cargo run --release
+make run
 ```
 
 Nonaut reuses your existing Codex login and remembers the selected provider,
@@ -52,8 +58,8 @@ new prompt while streaming interrupts the current response first.
 make check
 ```
 
-`make fmt`, `make lint`, `make test`, `make build`, and `make run` are also
-available.
+`make fmt`, `make lint`, `make test`, `make build`, `make smoke`, and `make run`
+are also available.
 
 Set `NONO_BIN` to override nono discovery. Otherwise Nonaut prefers
 `~/.local/bin/nono` and falls back to `PATH`.
