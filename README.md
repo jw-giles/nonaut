@@ -72,3 +72,7 @@ Set `NONO_BIN` to override nono discovery. Otherwise Nonaut prefers
 Push a version tag matching `Cargo.toml`, such as `v0.0.1`, to publish signed
 build provenance, checksums, and binaries for Linux and macOS on x86_64 and
 ARM64.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).
