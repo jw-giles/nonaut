@@ -45,6 +45,44 @@ nonaut
 The TUI and provider connection run normally. Only model-requested execution
 crosses the nono boundary.
 
+## Sandbox policy
+
+By default tools get the workspace and nothing else: no network, no other
+paths. An optional `policy.json` in nonaut's config directory
+(`~/.config/nonaut/policy.json` on Linux) widens that:
+
+```json
+{
+  "allow_hosts": ["crates.io", "*.crates.io", "github.com"],
+  "read_paths": ["~/.cargo/registry"],
+  "workspaces": {
+    "~/Work/site": { "allow_hosts": ["registry.npmjs.org"] }
+  }
+}
+```
+
+- `allow_hosts` lets tools reach those hosts over HTTPS (port 443) through a
+  local proxy that checks every connection. `*.` matches subdomains; `*` on
+  its own is rejected. Cloud metadata and link-local addresses are always
+  denied.
+- `read_paths` are readable, never writable.
+- A `workspaces` entry adds to the top-level rules for that directory.
+- On Linux, `allow_hosts` needs Landlock network rules (Linux 6.7+); older
+  kernels keep network fully blocked. Landlock limits connections by port
+  rather than address, so the proxy's port is reachable on any host; a
+  seccomp supervisor would close that gap.
+
+The file lives outside the workspace on purpose: tools can write the
+workspace, so a policy stored there could be edited to widen the sandbox.
+
+## Undo
+
+Nonaut snapshots the workspace before every agent turn and `/exec`. `/undo`
+restores the latest snapshot; run it again to step back further. `.git`,
+`target`, `node_modules` and `.gitignore`d files are not tracked. Snapshots
+are kept under `$XDG_STATE_HOME/nonaut/undo`, outside the sandbox's reach,
+and removed when nonaut exits.
+
 ## Providers
 
 Nonaut currently supports two providers:
@@ -65,6 +103,8 @@ provider, model, and reasoning effort.
 | `/reasoning` | Select reasoning effort |
 | `/new` | Start a fresh session |
 | `/exec <command>` | Run a command directly inside nono |
+| `/undo` | Restore files to before the last turn |
+| `/theme` | Switch between dark and light |
 | `/clear` | Clear the screen |
 | `/detach` | Keep the session running and return to the shell |
 | `/q` | Quit |

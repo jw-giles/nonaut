@@ -77,7 +77,7 @@ pub fn save_theme(theme: &str) -> Result<()> {
     write_config(config_dir()?.join("theme"), theme)
 }
 
-fn config_dir() -> Result<PathBuf> {
+pub(crate) fn config_dir() -> Result<PathBuf> {
     let project = ProjectDirs::from("ai", "nolabs", "nonaut")
         .context("could not determine the Nonaut configuration directory")?;
     Ok(project.config_dir().to_path_buf())

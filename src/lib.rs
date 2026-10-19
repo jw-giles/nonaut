@@ -1,7 +1,9 @@
 mod cli;
 mod config;
 mod mcp;
+mod policy;
 mod providers;
+mod proxy;
 mod sessions;
 mod tools;
 mod tui;
