@@ -56,6 +56,7 @@ pub async fn run_session_worker(id: String, workspace: std::path::PathBuf) -> Re
 
 pub async fn run_tui() -> Result<()> {
     let cwd = std::env::current_dir().context("could not determine the working directory")?;
+    tui::init_theme();
     let no_auto_connect = std::env::var_os("NONAUT_NO_AUTO_CONNECT").is_some();
     let mut app = if no_auto_connect {
         App::new_shell(cwd)
