@@ -1,10 +1,13 @@
 mod cli;
 mod config;
 mod mcp;
+mod policy;
 mod providers;
+mod proxy;
 mod sessions;
 mod tools;
 mod tui;
+mod undo;
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -56,6 +59,7 @@ pub async fn run_session_worker(id: String, workspace: std::path::PathBuf) -> Re
 
 pub async fn run_tui() -> Result<()> {
     let cwd = std::env::current_dir().context("could not determine the working directory")?;
+    tui::init_theme();
     let no_auto_connect = std::env::var_os("NONAUT_NO_AUTO_CONNECT").is_some();
     let mut app = if no_auto_connect {
         App::new_shell(cwd)
@@ -69,6 +73,7 @@ pub async fn run_tui() -> Result<()> {
         };
         App::new(cwd, default_provider, startup_warning)
     };
+    app.enable_undo();
     let mut terminal = ratatui::init();
     let keyboard_enhancements = execute!(
         std::io::stdout(),

@@ -14,6 +14,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use diffy::create_patch;
 use directories::BaseDirs;
 use nono::{AccessMode, CapabilitySet, Sandbox};
+
+use crate::policy::Network;
 use serde_json::{Value, json};
 use tokio::{io::AsyncWriteExt, process::Command};
 
@@ -138,7 +140,7 @@ pub async fn execute(workspace: &Path, tool: &str, arguments: &Value) -> Result<
     }
 
     let executable = std::env::current_exe().context("could not locate the Nonaut executable")?;
-    let mut child = sandbox_process(workspace, &executable);
+    let mut child = sandbox_process(workspace, &executable)?;
     child
         .arg("tool")
         .arg(workspace)
@@ -330,7 +332,7 @@ async fn run_command(workspace: &Path, arguments: &Value) -> Result<String> {
         .clamp(1, 120);
 
     let executable = std::env::current_exe().context("could not locate the Nonaut executable")?;
-    let mut command = sandbox_process(workspace, &executable);
+    let mut command = sandbox_process(workspace, &executable)?;
     command
         .arg("command")
         .arg(workspace)
@@ -350,7 +352,14 @@ async fn run_command(workspace: &Path, arguments: &Value) -> Result<String> {
     output_result(program, output)
 }
 
-fn sandbox_process(workspace: &Path, executable: &Path) -> Command {
+// Set by the parent from the policy file; read by the sandbox child before
+// it applies the sandbox. The child cannot change the parent's copy.
+const PROXY_PORT_ENV: &str = "NONAUT_PROXY_PORT";
+const NETWORK_BLOCKED_ENV: &str = "NONAUT_NETWORK_BLOCKED";
+const READ_PATHS_ENV: &str = "NONAUT_READ_PATHS";
+
+fn sandbox_process(workspace: &Path, executable: &Path) -> Result<Command> {
+    let policy = crate::policy::load(workspace)?;
     let mut command = Command::new(executable);
     command
         .arg("__nonaut_sandbox")
@@ -361,7 +370,40 @@ fn sandbox_process(workspace: &Path, executable: &Path) -> Command {
         .env("LANG", "C.UTF-8")
         .env("TERM", "dumb")
         .current_dir(workspace);
-    command
+    match policy.network {
+        Network::Open => {}
+        Network::Blocked => {
+            command.env(NETWORK_BLOCKED_ENV, "1");
+        }
+        Network::Allowlist => {
+            let port = crate::proxy::ensure(&policy.allow_hosts)?;
+            command.env(PROXY_PORT_ENV, port.to_string());
+        }
+    }
+    if !policy.read_paths.is_empty() {
+        let paths = policy
+            .read_paths
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+        command.env(READ_PATHS_ENV, paths);
+    }
+    Ok(command)
+}
+
+#[cfg(target_os = "linux")]
+fn landlock_filters_network() -> bool {
+    nono::sandbox::detect_abi().is_ok_and(|abi| abi.has_network())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn landlock_filters_network() -> bool {
+    true
+}
+
+fn proxy_port() -> Option<u16> {
+    std::env::var(PROXY_PORT_ENV).ok()?.parse().ok()
 }
 
 fn safe_path() -> String {
@@ -455,6 +497,21 @@ pub fn run_sandbox() -> Result<()> {
             .context("sandbox workspace was not provided")?,
     );
     let capabilities = sandbox_capabilities(&workspace)?;
+    #[cfg(target_os = "linux")]
+    {
+        let fallback =
+            Sandbox::apply_auto(&capabilities).context("could not apply the nono sandbox")?;
+        // A proxy-only fallback needs a seccomp supervisor nonaut does not
+        // run; refuse rather than continue with network unrestricted.
+        anyhow::ensure!(
+            !matches!(
+                fallback,
+                nono::sandbox::SeccompNetFallback::ProxyOnly { .. }
+            ),
+            "the nono sandbox could not restrict network on this kernel"
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
     Sandbox::apply_auto(&capabilities).context("could not apply the nono sandbox")?;
 
     match mode.as_str() {
@@ -471,7 +528,27 @@ pub fn run_sandbox() -> Result<()> {
 }
 
 fn sandbox_capabilities(workspace: &Path) -> Result<CapabilitySet> {
-    let mut capabilities = CapabilitySet::new().block_network();
+    // Network is open unless the policy blocks it or limits it to nonaut's
+    // filtering proxy.
+    let mut capabilities = match proxy_port() {
+        Some(port) if landlock_filters_network() => CapabilitySet::new().proxy_only(port),
+        Some(_) => {
+            // Without Landlock network rules (Linux < 6.7) nono cannot pin
+            // connections to the proxy port, so fail closed.
+            eprintln!(
+                "nonaut: this kernel cannot limit network to the policy proxy \
+                 (needs Linux 6.7+); network stays blocked"
+            );
+            CapabilitySet::new().block_network()
+        }
+        None if std::env::var_os(NETWORK_BLOCKED_ENV).is_some() => {
+            CapabilitySet::new().block_network()
+        }
+        None => CapabilitySet::new(),
+    };
+    for path in std::env::var(READ_PATHS_ENV).unwrap_or_default().lines() {
+        capabilities = allow_existing(capabilities, Path::new(path), AccessMode::Read)?;
+    }
     for path in system_read_paths() {
         capabilities = allow_existing(capabilities, Path::new(path), AccessMode::Read)?;
     }
@@ -651,7 +728,8 @@ fn run_sandboxed_command(_workspace: &Path, arguments: Vec<OsString>) -> Result<
     let program = arguments
         .next()
         .context("sandboxed command program was not provided")?;
-    let error = std::process::Command::new(&program)
+    let mut command = std::process::Command::new(&program);
+    command
         .args(arguments)
         .current_dir(workdir)
         .env_clear()
@@ -659,8 +737,14 @@ fn run_sandboxed_command(_workspace: &Path, arguments: Vec<OsString>) -> Result<
         .env("HOME", _workspace)
         .env("TMPDIR", _workspace)
         .env("LANG", "C.UTF-8")
-        .env("TERM", "dumb")
-        .exec();
+        .env("TERM", "dumb");
+    if let Some(port) = proxy_port() {
+        let proxy = format!("http://127.0.0.1:{port}");
+        for name in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+            command.env(name, &proxy);
+        }
+    }
+    let error = command.exec();
     Err(error).with_context(|| format!("could not execute `{}`", program.to_string_lossy()))
 }
 

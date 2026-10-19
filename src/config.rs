@@ -68,6 +68,21 @@ pub fn save_reasoning(provider: ProviderKind, model: &str, effort: &str) -> Resu
     write_config(path, &encoded)
 }
 
+pub fn load_theme() -> Result<Option<String>> {
+    let path = config_dir()?.join("theme");
+    Ok(read_config(&path, &legacy_path("theme")?)?.map(|(_, value)| value.trim().to_owned()))
+}
+
+pub fn save_theme(theme: &str) -> Result<()> {
+    write_config(config_dir()?.join("theme"), theme)
+}
+
+pub(crate) fn config_dir() -> Result<PathBuf> {
+    let project = ProjectDirs::from("ai", "nolabs", "nonaut")
+        .context("could not determine the Nonaut configuration directory")?;
+    Ok(project.config_dir().to_path_buf())
+}
+
 fn write_config(path: PathBuf, value: &str) -> Result<()> {
     let directory = path
         .parent()

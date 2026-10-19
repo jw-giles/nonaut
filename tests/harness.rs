@@ -55,9 +55,15 @@ fn binary() -> &'static str {
 }
 
 fn exec(workspace: &Path, command: &str) -> Output {
+    // A private config dir keeps the developer's own policy.json out of tests.
+    let home = workspace.parent().unwrap();
+    let config = home.join("config");
+    fs::create_dir_all(config_dir(workspace)).unwrap();
     Command::new(binary())
         .args(["exec", "--", command])
         .current_dir(workspace)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", &config)
         .env("NONAUT_TEST_SECRET", "must-not-cross-the-boundary")
         .output()
         .unwrap()
@@ -122,16 +128,56 @@ fn headless_exec_blocks_outside_files_and_inherited_secrets() {
 #[test]
 #[ignore = "provider-free black-box integration test"]
 fn headless_exec_blocks_network_connections() {
-    if !Command::new("sh")
+    if !curl_available() {
+        return;
+    }
+    let root = TestRoot::new("exec-network");
+    let workspace = root.workspace();
+    write_policy(&workspace, r#"{"network": "blocked"}"#);
+    assert!(
+        !curl_reaches_listener(&workspace),
+        "network access unexpectedly succeeded with \"network\": \"blocked\""
+    );
+}
+
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn headless_exec_allows_network_by_default() {
+    if !curl_available() {
+        return;
+    }
+    let root = TestRoot::new("exec-network-open");
+    let workspace = root.workspace();
+    assert!(
+        curl_reaches_listener(&workspace),
+        "sandboxed command could not reach the listener with the default policy"
+    );
+}
+
+fn write_policy(workspace: &Path, policy: &str) {
+    let config = config_dir(workspace);
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("policy.json"), policy).unwrap();
+}
+
+fn config_dir(workspace: &Path) -> PathBuf {
+    let home = workspace.parent().unwrap();
+    if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/ai.nolabs.nonaut")
+    } else {
+        home.join("config/nonaut")
+    }
+}
+
+fn curl_available() -> bool {
+    Command::new("sh")
         .args(["-c", "command -v curl"])
         .output()
         .is_ok_and(|output| output.status.success())
-    {
-        return;
-    }
+}
 
-    let root = TestRoot::new("exec-network");
-    let workspace = root.workspace();
+/// Runs a sandboxed curl against a local listener; true if it got through.
+fn curl_reaches_listener(workspace: &Path) -> bool {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
@@ -153,19 +199,18 @@ fn headless_exec_blocks_network_connections() {
         }
         false
     });
-
     let output = exec(
-        &workspace,
+        workspace,
         &format!("curl --silent --show-error --max-time 2 http://{address}"),
     );
-    assert!(
-        !output.status.success(),
-        "network access unexpectedly succeeded"
+    let reached = server.join().unwrap();
+    assert_eq!(
+        output.status.success(),
+        reached,
+        "curl result and listener disagree: {}",
+        combined(&output)
     );
-    assert!(
-        !server.join().unwrap(),
-        "sandboxed command reached the listener"
-    );
+    reached
 }
 
 struct PtyRun {

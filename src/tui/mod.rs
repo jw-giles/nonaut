@@ -1,9 +1,19 @@
-use std::{collections::HashMap, io, path::PathBuf, sync::LazyLock, time::Duration};
+use std::{
+    collections::HashMap,
+    io,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use futures_util::StreamExt;
+use nono::undo::ChangeType;
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Layout, Rect},
@@ -20,8 +30,12 @@ use tokio::{
 use tui_markdown::{Options as MarkdownOptions, StyleSheet, from_str_with_options};
 
 use crate::{
-    config::{load_model, load_reasoning, save_default_provider, save_model, save_reasoning},
+    config::{
+        load_model, load_reasoning, load_theme, save_default_provider, save_model, save_reasoning,
+        save_theme,
+    },
     providers::{Model, Provider, ProviderEvent, ProviderKind, ReasoningOption},
+    undo::Undo,
 };
 
 struct Palette {
@@ -60,14 +74,25 @@ const LIGHT: Palette = Palette {
     removed: Color::Rgb(217, 0, 27),
 };
 
-// NONAUT_THEME=light selects the light palette; anything else is dark.
-static PALETTE: LazyLock<Palette> = LazyLock::new(|| {
-    if std::env::var("NONAUT_THEME").is_ok_and(|theme| theme.eq_ignore_ascii_case("light")) {
-        LIGHT
+// Chosen at startup from NONAUT_THEME or the saved setting, then by /theme.
+static LIGHT_THEME: AtomicBool = AtomicBool::new(false);
+
+fn palette() -> &'static Palette {
+    if LIGHT_THEME.load(Ordering::Relaxed) {
+        &LIGHT
     } else {
-        DARK
+        &DARK
     }
-});
+}
+
+/// NONAUT_THEME wins over the saved /theme choice; dark is the default.
+pub(crate) fn init_theme() {
+    let light = match std::env::var("NONAUT_THEME") {
+        Ok(theme) => theme.eq_ignore_ascii_case("light"),
+        Err(_) => load_theme().ok().flatten().as_deref() == Some("light"),
+    };
+    LIGHT_THEME.store(light, Ordering::Relaxed);
+}
 // Driven by the event loop, not the terminal, so a frozen app stops blinking.
 const CURSOR_BLINK: Duration = Duration::from_millis(530);
 const BRAND_MARK: &str = "⎔";
@@ -82,7 +107,7 @@ struct SlashCommand {
     visible: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 11] = [
+const SLASH_COMMANDS: [SlashCommand; 13] = [
     SlashCommand {
         name: "/provider",
         description: "choose or reconnect a provider",
@@ -111,6 +136,16 @@ const SLASH_COMMANDS: [SlashCommand; 11] = [
     SlashCommand {
         name: "/clear",
         description: "clear the screen",
+        visible: true,
+    },
+    SlashCommand {
+        name: "/undo",
+        description: "restore files to before the last turn",
+        visible: true,
+    },
+    SlashCommand {
+        name: "/theme",
+        description: "switch between dark and light",
         visible: true,
     },
     SlashCommand {
@@ -145,27 +180,27 @@ struct NonautMarkdown;
 
 impl StyleSheet for NonautMarkdown {
     fn heading(&self, _level: u8) -> Style {
-        Style::new().fg(PALETTE.accent).bold()
+        Style::new().fg(palette().accent).bold()
     }
 
     fn code(&self) -> Style {
-        Style::new().fg(PALETTE.foreground).bg(PALETTE.surface)
+        Style::new().fg(palette().foreground).bg(palette().surface)
     }
 
     fn link(&self) -> Style {
-        Style::new().fg(PALETTE.accent).underlined()
+        Style::new().fg(palette().accent).underlined()
     }
 
     fn blockquote(&self) -> Style {
-        Style::new().fg(PALETTE.muted).italic()
+        Style::new().fg(palette().muted).italic()
     }
 
     fn heading_meta(&self) -> Style {
-        Style::new().fg(PALETTE.muted)
+        Style::new().fg(palette().muted)
     }
 
     fn metadata_block(&self) -> Style {
-        Style::new().fg(PALETTE.muted)
+        Style::new().fg(palette().muted)
     }
 
     fn code_block_fence(&self) -> &str {
@@ -173,23 +208,23 @@ impl StyleSheet for NonautMarkdown {
     }
 
     fn html(&self) -> Style {
-        Style::new().fg(PALETTE.muted)
+        Style::new().fg(palette().muted)
     }
 
     fn table_header(&self) -> Style {
-        Style::new().fg(PALETTE.accent).bold()
+        Style::new().fg(palette().accent).bold()
     }
 
     fn table_cell(&self) -> Style {
-        Style::new().fg(PALETTE.foreground)
+        Style::new().fg(palette().foreground)
     }
 
     fn table_border(&self) -> Style {
-        Style::new().fg(PALETTE.border)
+        Style::new().fg(palette().border)
     }
 
     fn list_marker(&self) -> Style {
-        Style::new().fg(PALETTE.accent)
+        Style::new().fg(palette().accent)
     }
 }
 
@@ -259,6 +294,7 @@ pub struct App {
     connection_generation: u64,
     request: Option<JoinHandle<()>>,
     request_uses_provider: bool,
+    undo: Option<Arc<Mutex<Undo>>>,
     request_generation: u64,
     queued_request: Option<String>,
     streaming_message: Option<usize>,
@@ -318,6 +354,7 @@ impl App {
             connection_generation: 0,
             request: None,
             request_uses_provider: false,
+            undo: None,
             request_generation: 0,
             queued_request: None,
             streaming_message: None,
@@ -380,25 +417,32 @@ impl App {
     fn new_input() -> TextArea<'static> {
         let mut input = TextArea::default();
         input.set_block(Self::prompt_block(0));
-        input.set_style(Style::new().fg(PALETTE.foreground).bg(PALETTE.background));
-        input.set_cursor_line_style(Style::new().bg(PALETTE.background));
-        input.set_cursor_style(Style::new().bg(PALETTE.accent).fg(PALETTE.background));
+        input.set_style(
+            Style::new()
+                .fg(palette().foreground)
+                .bg(palette().background),
+        );
+        input.set_cursor_line_style(Style::new().bg(palette().background));
+        input.set_cursor_style(Style::new().bg(palette().accent).fg(palette().background));
         input.set_placeholder_text("Ask anything…");
-        input.set_placeholder_style(Style::new().fg(PALETTE.muted));
+        input.set_placeholder_style(Style::new().fg(palette().muted));
         input
     }
 
     /// Rounded prompt with the token count in the top border and the key
     /// hints in the bottom border, so no separate footer row is needed.
     fn prompt_block(tokens: u64) -> Block<'static> {
-        let key = Style::new().fg(PALETTE.foreground);
-        let label = Style::new().fg(PALETTE.muted);
+        let key = Style::new().fg(palette().foreground);
+        let label = Style::new().fg(palette().muted);
         Block::new()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(PALETTE.accent))
-            .style(Style::new().bg(PALETTE.background))
-            .title_top(Line::styled(" › ", Style::new().fg(PALETTE.accent).bold()))
+            .border_style(Style::new().fg(palette().accent))
+            .style(Style::new().bg(palette().background))
+            .title_top(Line::styled(
+                " › ",
+                Style::new().fg(palette().accent).bold(),
+            ))
             .title_top(Line::styled(format!(" {tokens} tokens "), label).right_aligned())
             .title_bottom(Line::from(vec![
                 Span::styled(" Enter", key),
@@ -414,7 +458,7 @@ impl App {
 
     fn render(&mut self, frame: &mut Frame) {
         frame.render_widget(
-            Block::new().style(Style::new().bg(PALETTE.background)),
+            Block::new().style(Style::new().bg(palette().background)),
             frame.area(),
         );
         let prompt_lines = self
@@ -431,8 +475,8 @@ impl App {
         frame.render_widget(
             Block::new()
                 .borders(Borders::BOTTOM)
-                .border_style(PALETTE.border)
-                .style(Style::new().bg(PALETTE.background)),
+                .border_style(palette().border)
+                .style(Style::new().bg(palette().background)),
             header,
         );
         let [_, header_content, _] = Layout::vertical([
@@ -446,9 +490,9 @@ impl App {
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
                 format!("  {BRAND_MARK}  nonaut"),
-                Style::new().fg(PALETTE.accent).bold(),
+                Style::new().fg(palette().accent).bold(),
             )]))
-            .style(Style::new().bg(PALETTE.background)),
+            .style(Style::new().bg(palette().background)),
             brand,
         );
         frame.render_widget(
@@ -457,7 +501,7 @@ impl App {
                 self.provider_name, self.model_name, self.reasoning_effort
             ))
             .alignment(Alignment::Right)
-            .style(Style::new().fg(PALETTE.muted).bg(PALETTE.background)),
+            .style(Style::new().fg(palette().muted).bg(palette().background)),
             status,
         );
 
@@ -468,8 +512,8 @@ impl App {
                     for (index, line) in message.content.lines().enumerate() {
                         let marker = if index == 0 { "›  " } else { "   " };
                         lines.push(Line::from(vec![
-                            Span::styled(marker, Style::new().fg(PALETTE.accent).bold()),
-                            Span::styled(line, Style::new().fg(PALETTE.foreground).bold()),
+                            Span::styled(marker, Style::new().fg(palette().accent).bold()),
+                            Span::styled(line, Style::new().fg(palette().foreground).bold()),
                         ]));
                     }
                     lines.push(Line::default());
@@ -484,22 +528,22 @@ impl App {
                 }
                 Role::System | Role::Running | Role::Success | Role::Error => {
                     let border = match message.role {
-                        Role::Running => PALETTE.accent,
-                        Role::Success => PALETTE.added,
-                        Role::Error => PALETTE.removed,
-                        _ => PALETTE.border,
+                        Role::Running => palette().accent,
+                        Role::Success => palette().added,
+                        Role::Error => palette().removed,
+                        _ => palette().border,
                     };
                     let rows = message.content.lines().enumerate().map(|(index, line)| {
                         let style = if message.role == Role::Error && index == 0 {
-                            Style::new().fg(PALETTE.removed)
+                            Style::new().fg(palette().removed)
                         } else if (message.role == Role::Success && index == 0)
                             || (line.starts_with('+') && !line.starts_with("+++"))
                         {
-                            Style::new().fg(PALETTE.added)
+                            Style::new().fg(palette().added)
                         } else if line.starts_with('-') && !line.starts_with("---") {
-                            Style::new().fg(PALETTE.removed)
+                            Style::new().fg(palette().removed)
                         } else {
-                            Style::new().fg(PALETTE.muted)
+                            Style::new().fg(palette().muted)
                         };
                         (line, style)
                     });
@@ -530,10 +574,14 @@ impl App {
         }
         frame.render_widget(
             Paragraph::new(lines)
-                .style(Style::new().fg(PALETTE.foreground).bg(PALETTE.background))
+                .style(
+                    Style::new()
+                        .fg(palette().foreground)
+                        .bg(palette().background),
+                )
                 .block(
                     Block::new()
-                        .style(Style::new().bg(PALETTE.background))
+                        .style(Style::new().bg(palette().background))
                         .padding(Padding::horizontal(2)),
                 )
                 .wrap(Wrap { trim: false })
@@ -541,9 +589,11 @@ impl App {
             conversation,
         );
         self.input.set_cursor_style(if self.cursor_visible {
-            Style::new().bg(PALETTE.accent).fg(PALETTE.background)
+            Style::new().bg(palette().accent).fg(palette().background)
         } else {
-            Style::new().fg(PALETTE.foreground).bg(PALETTE.background)
+            Style::new()
+                .fg(palette().foreground)
+                .bg(palette().background)
         });
         self.input
             .set_block(Self::prompt_block(self.session_tokens));
@@ -587,11 +637,11 @@ impl App {
                 let marker = if index == selected { "›" } else { " " };
                 let style = if index == selected {
                     Style::new()
-                        .fg(PALETTE.background)
-                        .bg(PALETTE.accent)
+                        .fg(palette().background)
+                        .bg(palette().accent)
                         .bold()
                 } else {
-                    Style::new().fg(PALETTE.foreground).bg(PALETTE.surface)
+                    Style::new().fg(palette().foreground).bg(palette().surface)
                 };
                 Line::from(vec![
                     Span::styled(format!(" {marker} {:<12}", command.name), style),
@@ -600,7 +650,7 @@ impl App {
                         if index == selected {
                             style
                         } else {
-                            Style::new().fg(PALETTE.muted).bg(PALETTE.surface)
+                            Style::new().fg(palette().muted).bg(palette().surface)
                         },
                     ),
                 ])
@@ -609,11 +659,11 @@ impl App {
         frame.render_widget(Clear, popup);
         frame.render_widget(
             Paragraph::new(lines)
-                .style(Style::new().bg(PALETTE.surface))
+                .style(Style::new().bg(palette().surface))
                 .block(
                     Block::new()
                         .borders(Borders::ALL)
-                        .border_style(Style::new().fg(PALETTE.accent))
+                        .border_style(Style::new().fg(palette().accent))
                         .title(" commands · ↑/↓ or Tab select · Enter run "),
                 ),
             popup,
@@ -656,11 +706,11 @@ impl App {
                 let marker = if index == picker.selected { "›" } else { " " };
                 let style = if index == picker.selected {
                     Style::new()
-                        .fg(PALETTE.background)
-                        .bg(PALETTE.accent)
+                        .fg(palette().background)
+                        .bg(palette().accent)
                         .bold()
                 } else {
-                    Style::new().fg(PALETTE.foreground).bg(PALETTE.surface)
+                    Style::new().fg(palette().foreground).bg(palette().surface)
                 };
                 Line::styled(
                     format!(" {marker} {current} {}  {}", model.display_name, model.id),
@@ -670,11 +720,11 @@ impl App {
             .collect::<Vec<_>>();
         frame.render_widget(
             Paragraph::new(lines)
-                .style(Style::new().bg(PALETTE.surface))
+                .style(Style::new().bg(palette().surface))
                 .block(
                     Block::new()
                         .borders(Borders::ALL)
-                        .border_style(Style::new().fg(PALETTE.accent))
+                        .border_style(Style::new().fg(palette().accent))
                         .title(" model · ↑/↓ select · Enter apply · Esc close "),
                 ),
             popup,
@@ -711,28 +761,28 @@ impl App {
                 let marker = if index == picker.selected { "›" } else { " " };
                 let style = if index == picker.selected {
                     Style::new()
-                        .fg(PALETTE.background)
-                        .bg(PALETTE.accent)
+                        .fg(palette().background)
+                        .bg(palette().accent)
                         .bold()
                 } else {
-                    Style::new().fg(PALETTE.foreground).bg(PALETTE.surface)
+                    Style::new().fg(palette().foreground).bg(palette().surface)
                 };
                 [
                     Line::styled(format!(" {marker} {current} {}", option.id), style),
                     Line::styled(
                         format!("       {}", option.description),
-                        Style::new().fg(PALETTE.muted).bg(PALETTE.surface),
+                        Style::new().fg(palette().muted).bg(palette().surface),
                     ),
                 ]
             })
             .collect::<Vec<_>>();
         frame.render_widget(
             Paragraph::new(lines)
-                .style(Style::new().bg(PALETTE.surface))
+                .style(Style::new().bg(palette().surface))
                 .block(
                     Block::new()
                         .borders(Borders::ALL)
-                        .border_style(Style::new().fg(PALETTE.accent))
+                        .border_style(Style::new().fg(palette().accent))
                         .title(" reasoning · ↑/↓ select · Enter apply · Esc close "),
                 ),
             popup,
@@ -769,11 +819,11 @@ impl App {
                 let marker = if index == picker.selected { "›" } else { " " };
                 let style = if index == picker.selected {
                     Style::new()
-                        .fg(PALETTE.background)
-                        .bg(PALETTE.accent)
+                        .fg(palette().background)
+                        .bg(palette().accent)
                         .bold()
                 } else {
-                    Style::new().fg(PALETTE.foreground).bg(PALETTE.surface)
+                    Style::new().fg(palette().foreground).bg(palette().surface)
                 };
                 [
                     Line::styled(
@@ -782,18 +832,18 @@ impl App {
                     ),
                     Line::styled(
                         format!("       {}", provider.description()),
-                        Style::new().fg(PALETTE.muted).bg(PALETTE.surface),
+                        Style::new().fg(palette().muted).bg(palette().surface),
                     ),
                 ]
             })
             .collect::<Vec<_>>();
         frame.render_widget(
             Paragraph::new(lines)
-                .style(Style::new().bg(PALETTE.surface))
+                .style(Style::new().bg(palette().surface))
                 .block(
                     Block::new()
                         .borders(Borders::ALL)
-                        .border_style(Style::new().fg(PALETTE.accent))
+                        .border_style(Style::new().fg(palette().accent))
                         .title(" provider · ↑/↓ select · Enter connect · Esc close "),
                 ),
             popup,
@@ -1126,6 +1176,8 @@ impl App {
                 Ok(()) => self.push(Role::System, "Session detached."),
                 Err(error) => self.push(Role::Error, format!("Could not detach: {error:#}")),
             },
+            "/theme" => self.toggle_theme(),
+            "/undo" => self.undo_last(),
             "/help" => self.push(Role::System, Self::command_help()),
             _ if content.starts_with("/exec ") => {
                 let command = content[6..].trim().to_owned();
@@ -1140,6 +1192,73 @@ impl App {
                 self.interrupt_active();
             }
             _ => self.begin_request(content),
+        }
+    }
+
+    pub(crate) fn enable_undo(&mut self) {
+        match Undo::open(&self.cwd) {
+            Ok(undo) => self.undo = Some(Arc::new(Mutex::new(undo))),
+            Err(error) => self.push(
+                Role::System,
+                format!("/undo is unavailable this session: {error:#}"),
+            ),
+        }
+    }
+
+    fn undo_last(&mut self) {
+        if self.request.is_some() {
+            self.push(
+                Role::System,
+                "A response or command is running. Press Esc to stop it before /undo.",
+            );
+            return;
+        }
+        let Some(undo) = self.undo.clone() else {
+            self.push(Role::System, "/undo is unavailable this session.");
+            return;
+        };
+        let result = undo.lock().unwrap_or_else(PoisonError::into_inner).undo();
+        match result {
+            Ok(None) => self.push(Role::System, "Nothing to undo yet."),
+            Ok(Some(changes)) if changes.is_empty() => {
+                self.push(Role::System, "The last turn changed no tracked files.");
+            }
+            Ok(Some(changes)) => {
+                let mut lines = vec![format!(
+                    "Undid the last turn: {} file(s). The model is not told; mention it if you continue.",
+                    changes.len()
+                )];
+                for change in changes.iter().take(20) {
+                    let action = match change.change_type {
+                        ChangeType::Modified => "restored",
+                        ChangeType::Created => "recreated",
+                        ChangeType::Deleted => "removed",
+                        ChangeType::PermissionsChanged => "permissions",
+                    };
+                    let path = change.path.strip_prefix(&self.cwd).unwrap_or(&change.path);
+                    lines.push(format!("{action:<10} {}", path.display()));
+                }
+                if changes.len() > 20 {
+                    lines.push(format!("…and {} more", changes.len() - 20));
+                }
+                self.push(Role::Success, lines.join("\n"));
+            }
+            Err(error) => self.push(Role::Error, format!("Undo failed\n{error:#}")),
+        }
+    }
+
+    fn toggle_theme(&mut self) {
+        let light = !LIGHT_THEME.load(Ordering::Relaxed);
+        LIGHT_THEME.store(light, Ordering::Relaxed);
+        // The prompt caches its styles, so rebuild it with the new palette.
+        self.input = Self::new_input();
+        let name = if light { "light" } else { "dark" };
+        match save_theme(name) {
+            Ok(()) => self.push(Role::System, format!("Theme: {name}.")),
+            Err(error) => self.push(
+                Role::Error,
+                format!("Theme: {name} (could not save it: {error:#})"),
+            ),
         }
     }
 
@@ -1295,8 +1414,10 @@ impl App {
         let request_id = self.request_generation;
         let sender = self.events_tx.clone();
         let workspace = self.cwd.clone();
+        let undo = self.undo.clone();
         self.request_uses_provider = false;
         self.request = Some(tokio::spawn(async move {
+            checkpoint(undo).await;
             let _ = sender.send((request_id, ProviderEvent::ToolStarted("exec".to_owned())));
             let result = crate::tools::execute_shell(&workspace, command).await;
             let (success, output) = match result {
@@ -1326,7 +1447,9 @@ impl App {
         self.request_generation = self.request_generation.wrapping_add(1);
         let request_id = self.request_generation;
         let sender = self.events_tx.clone();
+        let undo = self.undo.clone();
         self.request = Some(tokio::spawn(async move {
+            checkpoint(undo).await;
             if let Err(error) = provider.stream(content, request_id, sender.clone()).await {
                 let _ = sender.send((request_id, ProviderEvent::Failed(format!("{error:#}"))));
             }
@@ -1657,6 +1780,19 @@ impl App {
     }
 }
 
+/// Snapshots the workspace before a turn can change it. Hashing runs off the
+/// event loop so the interface stays responsive on large workspaces.
+async fn checkpoint(undo: Option<Arc<Mutex<Undo>>>) {
+    if let Some(undo) = undo {
+        let _ = tokio::task::spawn_blocking(move || {
+            undo.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .checkpoint();
+        })
+        .await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1679,6 +1815,14 @@ mod tests {
         assert_eq!(prompt_rows("one line"), 4);
         assert_eq!(prompt_rows("a\nb\nc\nd"), 6);
         assert_eq!(prompt_rows(&"line\n".repeat(20)), 12);
+    }
+
+    #[test]
+    fn theme_flag_selects_the_palette() {
+        LIGHT_THEME.store(true, Ordering::Relaxed);
+        assert_eq!(palette().background, Color::Rgb(255, 255, 255));
+        LIGHT_THEME.store(false, Ordering::Relaxed);
+        assert_eq!(palette().background, Color::Rgb(0, 0, 0));
     }
 
     #[test]
