@@ -81,6 +81,14 @@ optional `policy.json` in nonaut's config directory
 The file lives outside the workspace on purpose: tools can write the
 workspace, so a policy stored there could be edited to widen the sandbox.
 
+## Project instructions
+
+If the workspace root has an `AGENTS.md` (or, failing that, a `CLAUDE.md`),
+nonaut adds it to every provider's instructions so the model learns the
+project's build, test and style conventions. Only a regular file is read, up
+to 32 KiB; symlinks and hard links are ignored so a tool cannot point it at a
+file outside the workspace.
+
 ## Undo
 
 Nonaut snapshots the workspace before every agent turn and `/exec`. `/undo`
