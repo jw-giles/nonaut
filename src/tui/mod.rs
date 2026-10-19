@@ -2,7 +2,10 @@ use std::{
     collections::HashMap,
     io,
     path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -10,6 +13,7 @@ use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use futures_util::StreamExt;
+use nono::undo::ChangeType;
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Layout, Rect},
@@ -31,6 +35,7 @@ use crate::{
         save_theme,
     },
     providers::{Model, Provider, ProviderEvent, ProviderKind, ReasoningOption},
+    undo::Undo,
 };
 
 struct Palette {
@@ -102,7 +107,7 @@ struct SlashCommand {
     visible: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 12] = [
+const SLASH_COMMANDS: [SlashCommand; 13] = [
     SlashCommand {
         name: "/provider",
         description: "choose or reconnect a provider",
@@ -131,6 +136,11 @@ const SLASH_COMMANDS: [SlashCommand; 12] = [
     SlashCommand {
         name: "/clear",
         description: "clear the screen",
+        visible: true,
+    },
+    SlashCommand {
+        name: "/undo",
+        description: "restore files to before the last turn",
         visible: true,
     },
     SlashCommand {
@@ -284,6 +294,7 @@ pub struct App {
     connection_generation: u64,
     request: Option<JoinHandle<()>>,
     request_uses_provider: bool,
+    undo: Option<Arc<Mutex<Undo>>>,
     request_generation: u64,
     queued_request: Option<String>,
     streaming_message: Option<usize>,
@@ -343,6 +354,7 @@ impl App {
             connection_generation: 0,
             request: None,
             request_uses_provider: false,
+            undo: None,
             request_generation: 0,
             queued_request: None,
             streaming_message: None,
@@ -1165,6 +1177,7 @@ impl App {
                 Err(error) => self.push(Role::Error, format!("Could not detach: {error:#}")),
             },
             "/theme" => self.toggle_theme(),
+            "/undo" => self.undo_last(),
             "/help" => self.push(Role::System, Self::command_help()),
             _ if content.starts_with("/exec ") => {
                 let command = content[6..].trim().to_owned();
@@ -1179,6 +1192,58 @@ impl App {
                 self.interrupt_active();
             }
             _ => self.begin_request(content),
+        }
+    }
+
+    pub(crate) fn enable_undo(&mut self) {
+        match Undo::open(&self.cwd) {
+            Ok(undo) => self.undo = Some(Arc::new(Mutex::new(undo))),
+            Err(error) => self.push(
+                Role::System,
+                format!("/undo is unavailable this session: {error:#}"),
+            ),
+        }
+    }
+
+    fn undo_last(&mut self) {
+        if self.request.is_some() {
+            self.push(
+                Role::System,
+                "A response or command is running. Press Esc to stop it before /undo.",
+            );
+            return;
+        }
+        let Some(undo) = self.undo.clone() else {
+            self.push(Role::System, "/undo is unavailable this session.");
+            return;
+        };
+        let result = undo.lock().unwrap_or_else(PoisonError::into_inner).undo();
+        match result {
+            Ok(None) => self.push(Role::System, "Nothing to undo yet."),
+            Ok(Some(changes)) if changes.is_empty() => {
+                self.push(Role::System, "The last turn changed no tracked files.");
+            }
+            Ok(Some(changes)) => {
+                let mut lines = vec![format!(
+                    "Undid the last turn: {} file(s). The model is not told; mention it if you continue.",
+                    changes.len()
+                )];
+                for change in changes.iter().take(20) {
+                    let action = match change.change_type {
+                        ChangeType::Modified => "restored",
+                        ChangeType::Created => "recreated",
+                        ChangeType::Deleted => "removed",
+                        ChangeType::PermissionsChanged => "permissions",
+                    };
+                    let path = change.path.strip_prefix(&self.cwd).unwrap_or(&change.path);
+                    lines.push(format!("{action:<10} {}", path.display()));
+                }
+                if changes.len() > 20 {
+                    lines.push(format!("…and {} more", changes.len() - 20));
+                }
+                self.push(Role::Success, lines.join("\n"));
+            }
+            Err(error) => self.push(Role::Error, format!("Undo failed\n{error:#}")),
         }
     }
 
@@ -1349,8 +1414,10 @@ impl App {
         let request_id = self.request_generation;
         let sender = self.events_tx.clone();
         let workspace = self.cwd.clone();
+        let undo = self.undo.clone();
         self.request_uses_provider = false;
         self.request = Some(tokio::spawn(async move {
+            checkpoint(undo).await;
             let _ = sender.send((request_id, ProviderEvent::ToolStarted("exec".to_owned())));
             let result = crate::tools::execute_shell(&workspace, command).await;
             let (success, output) = match result {
@@ -1380,7 +1447,9 @@ impl App {
         self.request_generation = self.request_generation.wrapping_add(1);
         let request_id = self.request_generation;
         let sender = self.events_tx.clone();
+        let undo = self.undo.clone();
         self.request = Some(tokio::spawn(async move {
+            checkpoint(undo).await;
             if let Err(error) = provider.stream(content, request_id, sender.clone()).await {
                 let _ = sender.send((request_id, ProviderEvent::Failed(format!("{error:#}"))));
             }
@@ -1708,6 +1777,19 @@ impl App {
             role,
             content: content.into(),
         });
+    }
+}
+
+/// Snapshots the workspace before a turn can change it. Hashing runs off the
+/// event loop so the interface stays responsive on large workspaces.
+async fn checkpoint(undo: Option<Arc<Mutex<Undo>>>) {
+    if let Some(undo) = undo {
+        let _ = tokio::task::spawn_blocking(move || {
+            undo.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .checkpoint();
+        })
+        .await;
     }
 }
 

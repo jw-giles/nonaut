@@ -5,6 +5,7 @@ mod providers;
 mod sessions;
 mod tools;
 mod tui;
+mod undo;
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -70,6 +71,7 @@ pub async fn run_tui() -> Result<()> {
         };
         App::new(cwd, default_provider, startup_warning)
     };
+    app.enable_undo();
     let mut terminal = ratatui::init();
     let keyboard_enhancements = execute!(
         std::io::stdout(),
