@@ -57,6 +57,7 @@ optional `policy.json` in nonaut's config directory
   "network": "allowlist",
   "allow_hosts": ["crates.io", "*.crates.io", "github.com"],
   "read_paths": ["~/.cargo/registry"],
+  "tool_timeout_seconds": 600,
   "workspaces": {
     "~/Work/site": { "allow_hosts": ["registry.npmjs.org"] }
   }
@@ -71,6 +72,9 @@ optional `policy.json` in nonaut's config directory
   its own is rejected. Cloud metadata and link-local addresses are always
   denied.
 - `read_paths` are readable, never writable.
+- `tool_timeout_seconds` (default 120, up to 3600) caps every tool call,
+  command and `/exec`; raise it for long builds or test suites. When a call
+  times out or is interrupted, everything it started is stopped.
 - A `workspaces` entry adds hosts and paths for that directory and may
   override `network`.
 - On Linux, `allow_hosts` needs Landlock network rules (Linux 6.7+); older
