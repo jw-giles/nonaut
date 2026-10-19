@@ -875,6 +875,13 @@ impl App {
             }
             return;
         }
+        if let Event::Paste(text) = &event {
+            // Terminals send CR or CRLF line ends; the prompt stores LF.
+            let text = text.replace("\r\n", "\n").replace('\r', "\n");
+            self.input.insert_str(text);
+            self.command_selection = 0;
+            return;
+        }
         if let Event::Mouse(mouse) = event {
             match mouse.kind {
                 MouseEventKind::ScrollUp => self.scroll_conversation_up(3),
@@ -1823,6 +1830,15 @@ mod tests {
         assert_eq!(palette().background, Color::Rgb(255, 255, 255));
         LIGHT_THEME.store(false, Ordering::Relaxed);
         assert_eq!(palette().background, Color::Rgb(0, 0, 0));
+    }
+
+    #[test]
+    fn pasted_newlines_stay_in_the_prompt_instead_of_submitting() {
+        let mut app = app_with_input("");
+        app.handle_terminal_event(Event::Paste("first\r\nsecond\rthird".to_owned()));
+        assert!(app.messages.is_empty());
+        assert!(app.request.is_none());
+        assert_eq!(app.input.lines(), ["first", "second", "third"]);
     }
 
     #[test]
