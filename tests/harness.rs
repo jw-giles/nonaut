@@ -56,11 +56,13 @@ fn binary() -> &'static str {
 
 fn exec(workspace: &Path, command: &str) -> Output {
     // A private config dir keeps the developer's own policy.json out of tests.
-    let config = workspace.parent().unwrap().join("config");
-    fs::create_dir_all(config.join("nonaut")).unwrap();
+    let home = workspace.parent().unwrap();
+    let config = home.join("config");
+    fs::create_dir_all(config_dir(workspace)).unwrap();
     Command::new(binary())
         .args(["exec", "--", command])
         .current_dir(workspace)
+        .env("HOME", home)
         .env("XDG_CONFIG_HOME", &config)
         .env("NONAUT_TEST_SECRET", "must-not-cross-the-boundary")
         .output()
@@ -153,9 +155,18 @@ fn headless_exec_allows_network_by_default() {
 }
 
 fn write_policy(workspace: &Path, policy: &str) {
-    let config = workspace.parent().unwrap().join("config/nonaut");
+    let config = config_dir(workspace);
     fs::create_dir_all(&config).unwrap();
     fs::write(config.join("policy.json"), policy).unwrap();
+}
+
+fn config_dir(workspace: &Path) -> PathBuf {
+    let home = workspace.parent().unwrap();
+    if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/ai.nolabs.nonaut")
+    } else {
+        home.join("config/nonaut")
+    }
 }
 
 fn curl_available() -> bool {
