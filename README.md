@@ -123,7 +123,7 @@ provider, model, and reasoning effort.
 | `/detach` | Keep the session running and return to the shell |
 | `/q` | Quit |
 
-`Shift+Enter` inserts a newline. `Esc` interrupts an active response. Sending a
+`Up` and `Down` recall earlier prompts in this session. `Shift+Enter` inserts a newline. `Esc` interrupts an active response. Sending a
 new prompt while streaming interrupts the current response first.
 
 `/exec` does not require a connected provider. It runs through the same fresh,
