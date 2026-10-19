@@ -38,7 +38,8 @@ nonaut
 ## Security model
 
 - Workspace access is read/write; everything outside it is denied.
-- Network access is blocked during tool execution.
+- Network access is open by default and can be blocked or limited to an
+  allowlist in the [sandbox policy](#sandbox-policy).
 - Provider credentials and ambient environment variables are not inherited.
 - Tool results include concise diffs and sandbox denials.
 
@@ -47,12 +48,13 @@ crosses the nono boundary.
 
 ## Sandbox policy
 
-By default tools get the workspace and nothing else: no network, no other
-paths. An optional `policy.json` in nonaut's config directory
-(`~/.config/nonaut/policy.json` on Linux) widens that:
+By default tools get the workspace, no other paths, and open network. An
+optional `policy.json` in nonaut's config directory
+(`~/.config/nonaut/policy.json` on Linux) changes that:
 
 ```json
 {
+  "network": "allowlist",
   "allow_hosts": ["crates.io", "*.crates.io", "github.com"],
   "read_paths": ["~/.cargo/registry"],
   "workspaces": {
@@ -61,12 +63,16 @@ paths. An optional `policy.json` in nonaut's config directory
 }
 ```
 
+- `network` is `open` (default), `blocked`, or `allowlist`. Open network lets
+  a tool send anything it can read in the workspace anywhere; use `blocked`
+  or `allowlist` for code you do not want leaving the machine.
 - `allow_hosts` lets tools reach those hosts over HTTPS (port 443) through a
   local proxy that checks every connection. `*.` matches subdomains; `*` on
   its own is rejected. Cloud metadata and link-local addresses are always
   denied.
 - `read_paths` are readable, never writable.
-- A `workspaces` entry adds to the top-level rules for that directory.
+- A `workspaces` entry adds hosts and paths for that directory and may
+  override `network`.
 - On Linux, `allow_hosts` needs Landlock network rules (Linux 6.7+); older
   kernels keep network fully blocked. Landlock limits connections by port
   rather than address, so the proxy's port is reachable on any host; a

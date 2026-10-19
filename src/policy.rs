@@ -1,4 +1,5 @@
-//! Optional sandbox policy: extra read-only paths and an HTTPS host allowlist.
+//! Optional sandbox policy: tool network mode, extra read-only paths and an
+//! HTTPS host allowlist.
 //!
 //! The file lives in nonaut's config directory, never in the workspace: the
 //! sandbox grants the agent write access to the workspace, so a policy stored
@@ -6,6 +7,7 @@
 //!
 //! ```json
 //! {
+//!   "network": "allowlist",
 //!   "allow_hosts": ["crates.io", "*.crates.io"],
 //!   "read_paths": ["~/.cargo/registry"],
 //!   "workspaces": {
@@ -14,9 +16,10 @@
 //! }
 //! ```
 //!
-//! Top-level entries apply everywhere; a `workspaces` entry whose path equals
-//! the workspace adds to them. A missing file means today's default: no
-//! network and no extra paths.
+//! `network` is `open` (the default), `blocked`, or `allowlist`; listing
+//! `allow_hosts` alone implies `allowlist`. Top-level entries apply
+//! everywhere; a `workspaces` entry whose path equals the workspace adds
+//! hosts and paths and may override `network`.
 
 use std::{
     collections::HashMap,
@@ -30,9 +33,21 @@ use directories::BaseDirs;
 use nono::net_filter::validate_host_pattern;
 use serde::Deserialize;
 
+/// How sandboxed tools may use the network.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Network {
+    #[default]
+    Open,
+    Blocked,
+    Allowlist,
+}
+
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Rules {
+    #[serde(default)]
+    network: Option<Network>,
     #[serde(default)]
     allow_hosts: Vec<String>,
     #[serde(default)]
@@ -43,6 +58,8 @@ struct Rules {
 #[serde(deny_unknown_fields)]
 struct File {
     #[serde(default)]
+    network: Option<Network>,
+    #[serde(default)]
     allow_hosts: Vec<String>,
     #[serde(default)]
     read_paths: Vec<String>,
@@ -52,6 +69,7 @@ struct File {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Policy {
+    pub network: Network,
     pub allow_hosts: Vec<String>,
     pub read_paths: Vec<PathBuf>,
 }
@@ -80,6 +98,7 @@ fn parse(text: &str, workspace: &Path, home: &Path) -> Result<Policy> {
     let file: File = serde_json::from_str(text)?;
     let workspace = fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let mut rules = Rules {
+        network: file.network,
         allow_hosts: file.allow_hosts,
         read_paths: file.read_paths,
     };
@@ -87,10 +106,27 @@ fn parse(text: &str, workspace: &Path, home: &Path) -> Result<Policy> {
         let path = expand_home(&path.to_string_lossy(), home);
         (fs::canonicalize(&path).unwrap_or(path) == workspace).then_some(rules)
     }) {
+        rules.network = extra.network.or(rules.network);
         rules.allow_hosts.extend(extra.allow_hosts.iter().cloned());
         rules.read_paths.extend(extra.read_paths.iter().cloned());
     }
 
+    let network = match (rules.network, rules.allow_hosts.is_empty()) {
+        (None, true) => Network::Open,
+        (None, false) | (Some(Network::Allowlist), false) => Network::Allowlist,
+        (Some(Network::Allowlist), true) => {
+            bail!("\"network\": \"allowlist\" needs at least one allow_hosts entry")
+        }
+        (Some(mode), false) => {
+            let mode = if mode == Network::Open {
+                "open"
+            } else {
+                "blocked"
+            };
+            bail!("allow_hosts only applies with \"network\": \"allowlist\", not \"{mode}\"")
+        }
+        (Some(mode), true) => mode,
+    };
     for host in &rules.allow_hosts {
         if host == "*" {
             bail!("allow_hosts may not contain \"*\"; list the hosts the sandbox needs");
@@ -110,6 +146,7 @@ fn parse(text: &str, workspace: &Path, home: &Path) -> Result<Policy> {
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Policy {
+        network,
         allow_hosts: rules.allow_hosts,
         read_paths,
     })
@@ -142,6 +179,7 @@ mod tests {
             Path::new("/home/me"),
         )
         .unwrap();
+        assert_eq!(policy.network, Network::Allowlist);
         assert_eq!(policy.allow_hosts, ["crates.io", "*.npmjs.org"]);
         assert_eq!(
             policy.read_paths,
@@ -157,6 +195,30 @@ mod tests {
         assert!(parse(r#"{"allow_hosts": ["foo*bar.com"]}"#, workspace, home).is_err());
         assert!(parse(r#"{"read_paths": ["relative/dir"]}"#, workspace, home).is_err());
         assert!(parse(r#"{"allow_host": ["crates.io"]}"#, workspace, home).is_err());
-        assert_eq!(parse("{}", workspace, home).unwrap(), Policy::default());
+        assert!(parse(r#"{"network": "allowlist"}"#, workspace, home).is_err());
+        assert!(
+            parse(
+                r#"{"network": "open", "allow_hosts": ["a.com"]}"#,
+                workspace,
+                home
+            )
+            .is_err()
+        );
+        assert!(parse(r#"{"network": "offline"}"#, workspace, home).is_err());
+    }
+
+    #[test]
+    fn network_is_open_by_default_and_workspaces_can_override_it() {
+        let home = Path::new("/home/me");
+        let policy = parse("{}", Path::new("/work"), home).unwrap();
+        assert_eq!(policy, Policy::default());
+        assert_eq!(policy.network, Network::Open);
+        let policy = parse(
+            r#"{"network": "blocked", "workspaces": {"/work": {"network": "open"}}}"#,
+            Path::new("/work"),
+            home,
+        )
+        .unwrap();
+        assert_eq!(policy.network, Network::Open);
     }
 }

@@ -14,6 +14,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use diffy::create_patch;
 use directories::BaseDirs;
 use nono::{AccessMode, CapabilitySet, Sandbox};
+
+use crate::policy::Network;
 use serde_json::{Value, json};
 use tokio::{io::AsyncWriteExt, process::Command};
 
@@ -353,6 +355,7 @@ async fn run_command(workspace: &Path, arguments: &Value) -> Result<String> {
 // Set by the parent from the policy file; read by the sandbox child before
 // it applies the sandbox. The child cannot change the parent's copy.
 const PROXY_PORT_ENV: &str = "NONAUT_PROXY_PORT";
+const NETWORK_BLOCKED_ENV: &str = "NONAUT_NETWORK_BLOCKED";
 const READ_PATHS_ENV: &str = "NONAUT_READ_PATHS";
 
 fn sandbox_process(workspace: &Path, executable: &Path) -> Result<Command> {
@@ -367,9 +370,15 @@ fn sandbox_process(workspace: &Path, executable: &Path) -> Result<Command> {
         .env("LANG", "C.UTF-8")
         .env("TERM", "dumb")
         .current_dir(workspace);
-    if !policy.allow_hosts.is_empty() {
-        let port = crate::proxy::ensure(&policy.allow_hosts)?;
-        command.env(PROXY_PORT_ENV, port.to_string());
+    match policy.network {
+        Network::Open => {}
+        Network::Blocked => {
+            command.env(NETWORK_BLOCKED_ENV, "1");
+        }
+        Network::Allowlist => {
+            let port = crate::proxy::ensure(&policy.allow_hosts)?;
+            command.env(PROXY_PORT_ENV, port.to_string());
+        }
     }
     if !policy.read_paths.is_empty() {
         let paths = policy
@@ -519,7 +528,8 @@ pub fn run_sandbox() -> Result<()> {
 }
 
 fn sandbox_capabilities(workspace: &Path) -> Result<CapabilitySet> {
-    // With an allowlist the only reachable port is nonaut's filtering proxy.
+    // Network is open unless the policy blocks it or limits it to nonaut's
+    // filtering proxy.
     let mut capabilities = match proxy_port() {
         Some(port) if landlock_filters_network() => CapabilitySet::new().proxy_only(port),
         Some(_) => {
@@ -531,7 +541,10 @@ fn sandbox_capabilities(workspace: &Path) -> Result<CapabilitySet> {
             );
             CapabilitySet::new().block_network()
         }
-        None => CapabilitySet::new().block_network(),
+        None if std::env::var_os(NETWORK_BLOCKED_ENV).is_some() => {
+            CapabilitySet::new().block_network()
+        }
+        None => CapabilitySet::new(),
     };
     for path in std::env::var(READ_PATHS_ENV).unwrap_or_default().lines() {
         capabilities = allow_existing(capabilities, Path::new(path), AccessMode::Read)?;
